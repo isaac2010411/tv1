@@ -1,0 +1,81 @@
+{
+  "broker": "binance",
+  "symbols": ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"],
+  "intervals": ["4h"],
+  "dateRange": {
+    "from": null,
+    "to": null
+  },
+  "strategy": {
+    "type": "EmaCrossover",
+    "params": {
+      "variant": "B",
+      "fastEMA": 20,
+      "slowEMA": 100,
+      "trendEMA": 200,
+      "rsiPeriod": 14,
+      "rsiLongMin": 55,
+      "rsiShortMax": 45,
+      "atrPeriod": 14,
+      "atrThreshold": 0.001,
+      "atrSmaPeriod": 20,
+      "adxPeriod": 14,
+      "adxMin": 20,
+      "volumeFilter": true,
+      "volumePeriod": 20,
+      "cooldownBars": 3,
+      "slopeFilter": true,
+      "wickFilter": true,
+      "allowShorts": true,
+      "maxCrossDistance": 2
+    }
+  },
+  "riskManagement": {
+    "accountSize": 10000,
+    "riskPercent": 0.01,
+    "stopLossMultiplier": 2,
+    "takeProfitMultiplier": 3,
+    "commissionRate": 0.0004,
+    "slippageRate": 0.0002,
+    "trailingStop": true,
+    "breakEven": true,
+    "maxConsecutiveLosses": 3,
+    "cooldownAfterLoss": 10
+  },
+  "backtest": {
+    "days": 730,
+    "backfill": true,
+    "trainTestSplit": 0.7,
+    "walkForward": {
+      "enabled": true,
+      "windowDays": 180,
+      "stepDays": 45
+    }
+  },
+  "optimization": {
+    "enabled": true,
+    "sortBy": "robustnessScore",
+    "topN": 10,
+    "neighborRobustness": true,
+    "minPositiveAssetsRatio": 0.55,
+    "minTrades": 30,
+    "maxDrawdownAllowed": 12,
+    "robustnessWeights": {
+      "return": 0.15,
+      "profitFactor": 0.10,
+      "sharpe": 0.15,
+      "assetConsistency": 0.30,
+      "drawdown": 0.15,
+      "overfitting": 0.10,
+      "lowTrades": 0.05
+    },
+    "grid": {
+      "variant": ["B", "D"],
+      "fastEMA": [20, 30],
+      "slowEMA": [100, 150],
+      "rsiLongMin": [52, 55, 58],
+      "stopLossMultiplier": [2, 2.5],
+      "takeProfitMultiplier": [3, 4]
+    }
+  }
+}

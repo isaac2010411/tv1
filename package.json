@@ -1,0 +1,32 @@
+{
+  "name": "trading_indicators",
+  "version": "1.0.0",
+  "description": "Aplicación que consume candles desde Kafka y calcula indicadores técnicos en tiempo real.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "start:legacy": "node index.js",
+    "dev": "nodemon src/server.js",
+    "dev:legacy": "nodemon index.js",
+    "report": "node scripts/generate_report.js",
+    "test": "jest",
+    "test:coverage": "jest --coverage"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "binance-api-node": "^0.13.6",
+    "cors": "^2.8.6",
+    "decimal.js": "^10.6.0",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "mongoose": "^9.2.1",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.0"
+  }
+}
