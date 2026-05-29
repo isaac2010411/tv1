@@ -142,16 +142,24 @@ class StateMachineSignalEngine {
     // Spread surcharge on entry: wide spread requires stronger conviction
     const spl = spreadPct > 0.001 ? +Math.min(spreadPct * 8, 0.06).toFixed(3) : 0
 
-    const thresholds = {
-      observe:       ts(0.11),                             // |score| to leave IDLE
-      bias:          ts(0.27),                             // |score| to reach BIAS
-      setup:         ts(0.45),                             // |score| to reach SETUP
-      entry:         +(ts(0.60) + spl).toFixed(3),         // |score| to fire ENTRY_SIGNAL
-      minConfidence: Math.round(35 + 15 * Math.min(volt, 1.0)),  // 35–50%
-      exitWarn:      ts(0.27),                             // reuses bias level
-      exitRecover:   ts(0.45),                             // reuses setup level
-    }
-
+    // const thresholds = {
+    //   observe:       ts(0.11),                             // |score| to leave IDLE
+    //   bias:          ts(0.27),                             // |score| to reach BIAS
+    //   setup:         ts(0.45),                             // |score| to reach SETUP
+    //   entry:         +(ts(0.60) + spl).toFixed(3),         // |score| to fire ENTRY_SIGNAL
+    //   minConfidence: Math.round(35 + 15 * Math.min(volt, 1.0)),  // 35–50%
+    //   exitWarn:      ts(0.27),                             // reuses bias level
+    //   exitRecover:   ts(0.45),                             // reuses setup level
+    // }
+const thresholds = {
+  observe:       ts(0.08),
+  bias:          ts(0.12),
+  setup:         ts(0.20),
+  entry:         +(ts(0.28) + spl).toFixed(3),
+  minConfidence: Math.round(28 + 10 * Math.min(volt, 1.0)),
+  exitWarn:      ts(0.12),
+  exitRecover:   ts(0.20),
+}
     // Timing: fast for low-vol scalping, conservative for high-vol assets.
     // Apply optional floors (used in semi-manual mode to keep the human
     // approval popup alive long enough).
