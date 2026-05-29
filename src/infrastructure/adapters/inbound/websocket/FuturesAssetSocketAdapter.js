@@ -890,7 +890,7 @@ class FuturesAssetSocketAdapter {
           if (this.scalpConfig?.costs) {
             accountState.costs = this.scalpConfig.costs
           }
-          const decision = this.riskManager.evaluateSignal({
+             const decision = this.riskManager.evaluateSignal({
             signal: incoming,
             factors: result.factors,
             position: null,
@@ -909,6 +909,13 @@ class FuturesAssetSocketAdapter {
             executionMode: decision.executionMode ?? (this.scalpConfig?.executionMode ?? 'auto'),
             activeRules,
           }
+
+          if (decision.approved === false) {
+            logger.info(
+              `[SocketAdapter] [RISK-AUTO] rejected ${symbol}: ${(decision.reasons ?? []).join('; ')}`,
+            )
+          }
+
           if (decision.approved && decision.mode === 'AUTO') {
             this._autoOpenPosition(symbol, room, incoming, decision, bundle)
           }
@@ -978,10 +985,20 @@ class FuturesAssetSocketAdapter {
           backendProcessedAt,
         })
 
-        this._persistSignalHistory({
+           this._persistSignalHistory({
           ...signalPayload,
           interval: bundle.signalEngine.interval,
-          decision: autoExecution?.mode === 'AUTO' ? 'AUTO_EXECUTED' : 'SIGNAL_UPDATE',
+          reasons: autoExecution?.approved === false
+            ? [
+                ...(Array.isArray(signalPayload.reasons) ? signalPayload.reasons : []),
+                ...(Array.isArray(autoExecution.reasons) ? autoExecution.reasons : []),
+              ]
+            : signalPayload.reasons,
+          decision: autoExecution?.approved === false
+            ? 'AUTO_REJECTED'
+            : autoExecution?.mode === 'AUTO'
+              ? 'AUTO_ACCEPTED'
+              : 'SIGNAL_UPDATE',
           activeSignalId: signalPayload.activeSignal?.id ?? null,
         })
       }

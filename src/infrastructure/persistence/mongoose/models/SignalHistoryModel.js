@@ -18,8 +18,8 @@ const SignalHistorySchema = new mongoose.Schema(
       default: 'SIGNAL_UPDATE',
       enum: [
         'SIGNAL_UPDATE',
-        'AUTO_EXECUTED',
         'AUTO_ACCEPTED',
+        'AUTO_REJECTED',
         'AUTO_CLOSED',
         'POSITION_ACCEPTED',
         'POSITION_CLOSED',
