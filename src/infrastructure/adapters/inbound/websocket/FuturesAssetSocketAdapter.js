@@ -7,7 +7,9 @@ const { OrderBook } = require('../../../../domain/futures/entities/OrderBook')
 const { SpoofingDetectorService } = require('../../../../domain/futures/services/SpoofingDetectorService')
 const { LiquidityShiftService } = require('../../../../domain/futures/services/LiquidityShiftService')
 const { CvdService } = require('../../../../domain/futures/services/CvdService')
-const { FootprintCandleService } = require('../../../../domain/futures/services/FootprintCandleService')
+const { OrderBookMetrics } = require('../../../../domain/futures/services/OrderBookMetrics')
+const { SessionCandleStore } = require('../../../../domain/futures/services/SessionCandleStore')
+const { DecisionTapeService } = require('../../../../domain/futures/services/DecisionTapeService')
 const { PaperTradeService } = require('../../../../domain/futures/services/PaperTradeService')
 const { LocalOrderBookEngine } = require('../../../marketdata/LocalOrderBookEngine')
 const {
@@ -19,6 +21,18 @@ const { EmitCoalescer } = require('../../../realtime/EmitCoalescer')
 
 /** Max closed candles kept per interval in the signal engine's candle history. */
 const MAX_CANDLE_HISTORY = 500
+/** Minimum closed candles needed for EMA50-driven signal context. */
+const MIN_SIGNAL_CANDLE_HISTORY = 50
+/** Max order-book levels sent to the browser per side on high-frequency frames. */
+const WIRE_BOOK_LEVELS = Number(process.env.WIRE_BOOK_LEVELS ?? 60)
+/** Max footprint price levels sent to the browser per footprint candle. */
+const WIRE_FOOTPRINT_LEVELS = Number(process.env.WIRE_FOOTPRINT_LEVELS ?? 80)
+/** Minimum ms between local book frames sent to the browser. */
+const BOOK_LOCAL_EMIT_MS = Number(process.env.BOOK_LOCAL_EMIT_MS ?? 500)
+/** Minimum ms between book metrics frames sent to the browser. */
+const BOOK_METRICS_EMIT_MS = Number(process.env.BOOK_METRICS_EMIT_MS ?? 250)
+/** Minimum ms between decision tape frames sent to the browser. */
+const DECISION_TAPE_EMIT_MS = Number(process.env.DECISION_TAPE_EMIT_MS ?? 1_000)
 /** Max CVD history entries kept for the signal engine. */
 const MAX_CVD_HISTORY = 200
 /** Max spoofing candidates kept for the signal engine. */
@@ -38,6 +52,7 @@ const DEPTH_BACKPRESSURE_SKIP_SERVICES_THRESHOLD = Number(
   process.env.DEPTH_BACKPRESSURE_SKIP_SERVICES_THRESHOLD ?? 180,
 )
 const TRADE_OUT_OF_ORDER_TOLERANCE_MS = Number(process.env.TRADE_OUT_OF_ORDER_TOLERANCE_MS ?? 150)
+const SESSION_ID = process.env.TRADING_SESSION_ID ?? 'default'
 // Phase 2.B — Opt-in coalescer for high-frequency events. Disabled by default
 // to keep wire-format BC; enable with EMIT_BATCH_MODE=true.
 const EMIT_BATCH_MODE = process.env.EMIT_BATCH_MODE === 'true'
@@ -129,6 +144,8 @@ class FuturesAssetSocketAdapter {
     this.tradingPersistence = tradingPersistence
     this.riskManager = riskManager
     this.portfolioManager = portfolioManager
+    this.orderBookMetrics = new OrderBookMetrics()
+    this.decisionTapeService = new DecisionTapeService()
     // Scalp / micro-operation runtime config. May be null when running with
     // the default (legacy) horizon — in that case scoring & risk behave as
     // before. See `loadScalpConfig` in src/config/runtimeConfig.js.
@@ -242,28 +259,40 @@ class FuturesAssetSocketAdapter {
   }
 
   _initSymbolServices(symbol, tickSize, intervals, room) {
-    const footprints = new Map()
-    for (const interval of intervals) {
-      footprints.set(interval, new FootprintCandleService({ symbol, interval, tickSize }))
-    }
-
     const localBook = new LocalOrderBookEngine({
       symbol,
       onBook: (ob) => {
         const backendReceivedAt = Date.now()
-        const bookPayload = ob.toJSON()
+        const bookMetrics = this.orderBookMetrics.compute(ob, 20)
         const backendProcessedAt = Date.now()
-        this._emitToRoom(room, FUTURES_SOCKET_EVENTS.BOOK_LOCAL, bookPayload, {
-          stream: 'book.local',
-          symbol,
-          backendReceivedAt,
-          backendProcessedAt,
-        })
-
         const bundle = this._symbolServices.get(symbol)
         if (!bundle) return
-
+        bundle._lastBookMetrics = bookMetrics
         const nowMs = Date.now()
+
+        if (!bundle._lastBookLocalEmitAt || nowMs - bundle._lastBookLocalEmitAt >= BOOK_LOCAL_EMIT_MS) {
+          bundle._lastBookLocalEmitAt = nowMs
+          const bookPayload = compactBookForWire({ ...ob.toJSON(), bookMetrics })
+          this._emitToRoom(room, FUTURES_SOCKET_EVENTS.BOOK_LOCAL, bookPayload, {
+            stream: 'book.local',
+            symbol,
+            backendReceivedAt,
+            backendProcessedAt,
+          })
+        }
+
+        if (!bundle._lastBookMetricsEmitAt || nowMs - bundle._lastBookMetricsEmitAt >= BOOK_METRICS_EMIT_MS) {
+          bundle._lastBookMetricsEmitAt = nowMs
+          this._emitToRoom(room, FUTURES_SOCKET_EVENTS.BOOK_METRICS, bookMetrics, {
+            stream: 'book.metrics',
+            symbol,
+            backendReceivedAt,
+            backendProcessedAt,
+          })
+        }
+
+        this._emitDecisionTape(symbol, room, bundle)
+
         if (!bundle._lastHealthEmitAt || nowMs - bundle._lastHealthEmitAt >= 1_000) {
           bundle._lastHealthEmitAt = nowMs
           try {
@@ -313,11 +342,13 @@ class FuturesAssetSocketAdapter {
             bundle._recentSpoofingCandidates.push(plain)
           }
           for (const ev of bundle.shift.update(ob, sharedCtx)) {
-            this._emitToRoom(room, FUTURES_SOCKET_EVENTS.LIQUIDITY_SHIFT, ev.toPlainObject(), {
+            const plain = ev.toPlainObject()
+            this._emitToRoom(room, FUTURES_SOCKET_EVENTS.LIQUIDITY_SHIFT, plain, {
               stream: 'liquidity.shift',
               symbol,
               backendReceivedAt,
             })
+            bundle._recentLiquidityShifts.push(plain)
           }
         } catch (err) {
           logger.warn(`[SocketAdapter] localBook service error for ${symbol}: ${err.message}`)
@@ -335,7 +366,12 @@ class FuturesAssetSocketAdapter {
       spoof: new SpoofingDetectorService({ symbol, tickSize }),
       shift: new LiquidityShiftService({ symbol }),
       cvd: new CvdService({ symbol }),
-      footprints,
+      sessionCandles: new SessionCandleStore({
+        symbol,
+        intervals,
+        tickSize,
+        maxHistory: MAX_CANDLE_HISTORY,
+      }),
       localBook,
       signalEngine: new StateMachineSignalEngine({
         interval: intervals[0] ?? '1m',
@@ -348,9 +384,10 @@ class FuturesAssetSocketAdapter {
             ? Number(this.scalpConfig?.manualReviewExpiryMs ?? 0)
             : 0) || 0,
       }),
-      _candleHistory: new Map(),
       _recentCvdHistory: new RingBuffer(MAX_CVD_HISTORY),
       _recentSpoofingCandidates: new RingBuffer(MAX_SPOOF_CANDIDATES),
+      _recentLiquidityShifts: new RingBuffer(MAX_SPOOF_CANDIDATES),
+      _recentTradeQtys: new RingBuffer(MAX_CVD_HISTORY),
       _depthDeltaQueue: [],
       _depthDrainScheduled: false,
       _droppedDepthDeltas: 0,
@@ -359,26 +396,18 @@ class FuturesAssetSocketAdapter {
       _lastMarkPrice: null,
       lastResyncAt: null,
       _lastHealthEmitAt: null,
+      _lastBookLocalEmitAt: null,
+      _lastBookMetricsEmitAt: null,
+      _lastDecisionTapeEmitAt: null,
       _lastSignalEngineRunAt: 0,
       _lastMissingContextKey: '',
       _streamSequences: new Map(),
       _lastTradeEventTime: null,
       _droppedOutOfOrderTrades: 0,
       _lastOrderBook: null,
+      _lastBookMetrics: null,
       _signalEngineTimer: null,
     })
-
-    // Drive the signal engine on a fixed cadence per symbol, decoupled from
-    // the order-book emission callback. This eliminates the per-emit throttle
-    // check and lets us reason about signal-engine cost independently of book
-    // update frequency.
-    const bundle = this._symbolServices.get(symbol)
-    bundle._signalEngineTimer = setInterval(() => {
-      const b = this._symbolServices.get(symbol)
-      if (!b || !b._lastOrderBook) return
-      this._runSignalEngine(symbol, room, b._lastOrderBook)
-    }, SIGNAL_ENGINE_THROTTLE_MS)
-    if (bundle._signalEngineTimer.unref) bundle._signalEngineTimer.unref()
 
     metrics.activeSymbols.set({}, this._symbolServices.size)
     metrics.activeRooms.set({}, this._roomRefs.size)
@@ -398,9 +427,11 @@ class FuturesAssetSocketAdapter {
     bundle.cvd.reset()
     bundle.localBook.reset()
     bundle.signalEngine.reset()
-    bundle._candleHistory.clear()
+    bundle.sessionCandles.reset()
     bundle._recentCvdHistory.clear()
     bundle._recentSpoofingCandidates.clear()
+    bundle._recentLiquidityShifts.clear()
+    bundle._recentTradeQtys.clear()
     bundle._depthDeltaQueue.length = 0
     bundle._depthDrainScheduled = false
     bundle._droppedDepthDeltas = 0
@@ -410,7 +441,10 @@ class FuturesAssetSocketAdapter {
     bundle._lastTradeEventTime = null
     bundle._droppedOutOfOrderTrades = 0
     bundle._lastOrderBook = null
-    for (const svc of bundle.footprints.values()) svc.reset()
+    bundle._lastBookMetrics = null
+    bundle._lastBookLocalEmitAt = null
+    bundle._lastBookMetricsEmitAt = null
+    bundle._lastDecisionTapeEmitAt = null
     this._symbolServices.delete(symbol)
     // Drop closed-position history for this symbol (open positions are kept so
     // that an unsubscribe + resubscribe within a session doesn't lose state).
@@ -573,19 +607,43 @@ class FuturesAssetSocketAdapter {
     await Promise.all(
       intervals.map(async (interval) => {
         try {
+          let restoredCandles = []
+          if (this.tradingPersistence?.listSessionCandles) {
+            const restored = await this.tradingPersistence.listSessionCandles({
+              sessionId: SESSION_ID,
+              symbol,
+              interval,
+              limit: SEED_LIMIT,
+            })
+            restoredCandles = Array.isArray(restored?.items) ? restored.items.slice().reverse() : []
+            if (restoredCandles.length >= MIN_SIGNAL_CANDLE_HISTORY) {
+              const hist = bundle.sessionCandles.seedCandles(interval, restoredCandles)
+              logger.debug(`[SocketAdapter] Restored ${hist.length} ${interval} session candles for ${symbol}`)
+              return
+            }
+          }
           const candles = await this.marketDataPort.getCandles(symbol, interval, SEED_LIMIT)
-          if (!Array.isArray(candles) || candles.length === 0) return
-          const closedCandles = candles.slice(0, -1)
+          const exchangeCandles = Array.isArray(candles) ? candles : []
+          const closedCandles = mergeCandlesByOpenTime(exchangeCandles.slice(0, -1), restoredCandles)
           if (closedCandles.length === 0) return
-          if (!bundle._candleHistory.has(interval)) bundle._candleHistory.set(interval, [])
-          const hist = bundle._candleHistory.get(interval)
-          if (hist.length === 0) hist.push(...closedCandles.slice(-MAX_CANDLE_HISTORY))
+          const hist = bundle.sessionCandles.seedCandles(interval, closedCandles)
           logger.debug(`[SocketAdapter] Seeded ${hist.length} ${interval} candles for ${symbol}`)
         } catch (err) {
           logger.warn(`[SocketAdapter] Failed to seed ${interval} candle history for ${symbol}: ${err.message}`)
         }
       }),
     )
+  }
+
+  _startSignalEngineTimer(symbol, room) {
+    const bundle = this._symbolServices.get(symbol)
+    if (!bundle || bundle._signalEngineTimer) return
+    bundle._signalEngineTimer = setInterval(() => {
+      const b = this._symbolServices.get(symbol)
+      if (!b || !b._lastOrderBook) return
+      this._runSignalEngine(symbol, room, b._lastOrderBook)
+    }, SIGNAL_ENGINE_THROTTLE_MS)
+    if (bundle._signalEngineTimer.unref) bundle._signalEngineTimer.unref()
   }
 
   async _onSubscribe(socket, payload) {
@@ -634,7 +692,9 @@ class FuturesAssetSocketAdapter {
         await this._resyncLocalBook(normalizedSymbol)
         await this._seedCandleHistory(normalizedSymbol, intervals)
         await this._restoreOpenPositions(normalizedSymbol)
+        this._startSignalEngineTimer(normalizedSymbol, room)
       }
+      this._emitSessionCandleInit(socket, normalizedSymbol)
       this._emitFootprintInit(socket, normalizedSymbol)
       logger.info(`[SocketAdapter] ${socket.id} subscribed to ${normalizedSymbol} (refs: ${refCount})`)
     } catch (err) {
@@ -727,26 +787,54 @@ class FuturesAssetSocketAdapter {
       },
       onCandle: (data) => {
         const backendReceivedAt = Date.now()
-        this._emitToRoom(room, FUTURES_SOCKET_EVENTS.MARKET_CANDLE, data, {
+        const bundle = this._symbolServices.get(symbol)
+        if (!bundle) {
+          this._emitToRoom(room, FUTURES_SOCKET_EVENTS.MARKET_CANDLE, data, {
+            stream: `market.candle.${data.interval}`,
+            symbol,
+            backendReceivedAt,
+            exchangeEventTime: extractExchangeEventTime(data),
+          })
+          return
+        }
+        const sessionUpdate = bundle.sessionCandles.upsertCandle(data)
+        if (!sessionUpdate) return
+        const indicators = sessionUpdate.indicators
+        const candlePayload = indicators ? { ...data, indicators } : data
+        this._emitToRoom(room, FUTURES_SOCKET_EVENTS.MARKET_CANDLE, candlePayload, {
           stream: `market.candle.${data.interval}`,
           symbol,
           backendReceivedAt,
           exchangeEventTime: extractExchangeEventTime(data),
         })
-        const bundle = this._symbolServices.get(symbol)
-        if (!bundle) return
-        if (data.isFinal) {
-          if (!bundle._candleHistory.has(data.interval)) bundle._candleHistory.set(data.interval, [])
-          const hist = bundle._candleHistory.get(data.interval)
-          hist.push(data)
-          if (hist.length > MAX_CANDLE_HISTORY) hist.shift()
+        if (indicators) {
+          this._emitToRoom(room, FUTURES_SOCKET_EVENTS.MARKET_INDICATORS, indicators, {
+            stream: `market.indicators.${data.interval}`,
+            symbol,
+            backendReceivedAt,
+          })
         }
-        const svc = bundle.footprints.get(data.interval)
-        if (!svc) return
+        const compactFootprint = sessionUpdate.footprint
+          ? compactFootprintForWire(sessionUpdate.footprint.toPlainObject())
+          : null
+        const compactSnapshot = sessionUpdate.snapshot?.footprint
+          ? { ...sessionUpdate.snapshot, footprint: compactFootprintForWire(sessionUpdate.snapshot.footprint) }
+          : sessionUpdate.snapshot
+        this._emitToRoom(room, FUTURES_SOCKET_EVENTS.SESSION_CANDLE_SNAPSHOT, compactSnapshot, {
+          stream: `session.candle.${data.interval}`,
+          symbol,
+          backendReceivedAt,
+        })
+        if (sessionUpdate.wasFinalized) {
+          this._persistSessionCandle({
+            ...sessionUpdate.finalizedCandle,
+            sessionId: SESSION_ID,
+            indicators,
+            footprintSummary: compactFootprint,
+          })
+        }
         try {
-          svc.updateFromCandle(data)
-          const current = svc.getCurrent()
-          const payload = current ? current.toPlainObject() : (svc.getHistory(1)[0]?.toPlainObject() ?? null)
+          const payload = compactFootprint
           if (payload) {
             this._emitToRoom(
               room,
@@ -766,14 +854,17 @@ class FuturesAssetSocketAdapter {
       onTrade: (data) => {
         const t0 = LATENCY_DEBUG ? performance.now() : 0
         const backendReceivedAt = Date.now()
-        this._emitToRoom(room, FUTURES_SOCKET_EVENTS.TRADE_AGG, data, {
+        const bundle = this._symbolServices.get(symbol)
+        const enrichedTrade = bundle ? enrichTrade(data, bundle._recentTradeQtys.toArray()) : data
+        this._emitToRoom(room, FUTURES_SOCKET_EVENTS.TRADE_AGG, enrichedTrade, {
           stream: 'trade.agg',
           symbol,
           backendReceivedAt,
           exchangeEventTime: extractExchangeEventTime(data),
         })
-        const bundle = this._symbolServices.get(symbol)
         if (!bundle) return
+        const tradeQty = Number(data.qty ?? data.quantity)
+        if (Number.isFinite(tradeQty) && tradeQty > 0) bundle._recentTradeQtys.push(tradeQty)
 
         const tradeEventTime = extractExchangeEventTime(data)
         const hasTradeEventTime = Number.isFinite(Number(tradeEventTime))
@@ -815,9 +906,11 @@ class FuturesAssetSocketAdapter {
           bundle._recentCvdHistory.push({
             side: cvdUpdate.side,
             qty: parseFloat(data.qty),
+            delta: parseFloat(cvdUpdate.delta),
             time: data.time ?? Date.now(),
           })
-          for (const svc of bundle.footprints.values()) svc.updateFromTrade(data)
+          this._emitDecisionTape(symbol, room, bundle)
+          bundle.sessionCandles.addTrade(data)
 
           if (LATENCY_DEBUG) {
             const ms = performance.now() - t0
@@ -845,7 +938,7 @@ class FuturesAssetSocketAdapter {
     try {
       const result = bundle.signalEngine.process(symbol, {
         orderBook: orderBook ?? null,
-        candleHistory: bundle._candleHistory,
+        candleHistory: bundle.sessionCandles.getCandleHistoryMap(),
         cvdHistory: bundle._recentCvdHistory.toArray(),
         spoofingCandidates: bundle._recentSpoofingCandidates.toArray(),
         markPrice: bundle._lastMarkPrice,
@@ -873,6 +966,7 @@ class FuturesAssetSocketAdapter {
           const accountState = {
             dailyPnl: this.paperTradeService.getDailyPnl?.() ?? 0,
             executionMode: this.scalpConfig?.executionMode ?? 'auto',
+            horizon: this.scalpConfig?.horizon ?? 'default',
           }
           if (this.scalpConfig?.account) {
             // Equity is the running paper-account cap (starting $10k +
@@ -985,9 +1079,12 @@ class FuturesAssetSocketAdapter {
           backendProcessedAt,
         })
 
-           this._persistSignalHistory({
+        this._persistSignalHistory({
           ...signalPayload,
           interval: bundle.signalEngine.interval,
+          signalRisk: signalPayload.activeSignal?.risk ?? signalPayload.signal?.risk ?? null,
+          adjustedRisk: autoExecution?.adjustedRisk ?? null,
+          factorsSummary: compactSignalFactors(result.factors),
           reasons: autoExecution?.approved === false
             ? [
                 ...(Array.isArray(signalPayload.reasons) ? signalPayload.reasons : []),
@@ -1032,6 +1129,7 @@ class FuturesAssetSocketAdapter {
         userId: 'risk-manager',
         direction,
         entryPrice,
+        quantity: risk.recommendedQuantity ?? risk.quantity ?? signal.quantity ?? null,
         stopLoss: risk.stopLoss ?? null,
         takeProfit: risk.takeProfit ?? null,
         sourceSignalId: signal.id,
@@ -1049,6 +1147,7 @@ class FuturesAssetSocketAdapter {
         stream: 'paperTrade.opened',
         symbol,
       })
+      this._emitPaperPortfolioSnapshot()
       this._persistPaperPosition(opened)
       this._persistSignalHistory({
         timestamp: Date.now(),
@@ -1063,6 +1162,15 @@ class FuturesAssetSocketAdapter {
         decision: 'AUTO_ACCEPTED',
         activeSignalId: signal.id,
         positionId: opened.id,
+        signalRisk: signal.risk ?? null,
+        adjustedRisk: decision.adjustedRisk ?? null,
+        autoExecution: {
+          mode: decision.mode,
+          approved: decision.approved,
+          rule: decision.rule,
+          regime: decision.regime,
+          reasons: decision.reasons,
+        },
       })
       bundle.signalEngine.notifyPositionAccepted({
         entryPrice,
@@ -1100,6 +1208,7 @@ class FuturesAssetSocketAdapter {
       })
       this._persistPaperPosition(closed)
       this.portfolioManager?.recordPaperClose(closed)
+      this._emitPaperPortfolioSnapshot()
       this._persistSignalHistory({
         timestamp: Date.now(),
         symbol,
@@ -1129,6 +1238,7 @@ class FuturesAssetSocketAdapter {
         stream: 'paperTrade.updated',
         symbol,
       })
+      this._emitPaperPortfolioSnapshot()
       this._persistPaperPosition(updated)
       logger.debug(
         `[SocketAdapter] [RISK-AUTO] adjusted SL ${symbol} → ${action.newStopLoss} (${action.reason})`,
@@ -1188,6 +1298,7 @@ class FuturesAssetSocketAdapter {
         })
 
         this._persistPaperPosition(opened)
+        this._emitPaperPortfolioSnapshot()
         this._persistSignalHistory({
           timestamp: Date.now(),
           symbol,
@@ -1238,6 +1349,7 @@ class FuturesAssetSocketAdapter {
       })
       this._persistPaperPosition(closed)
       this.portfolioManager?.recordPaperClose(closed)
+      this._emitPaperPortfolioSnapshot()
       this._persistSignalHistory({
         timestamp: Date.now(),
         symbol,
@@ -1273,6 +1385,7 @@ class FuturesAssetSocketAdapter {
           backendReceivedAt,
         })
         this._persistPaperPosition(event.position)
+        this._emitPaperPortfolioSnapshot()
         continue
       }
 
@@ -1284,6 +1397,7 @@ class FuturesAssetSocketAdapter {
         })
         this._persistPaperPosition(event.position)
         this.portfolioManager?.recordPaperClose(event.position)
+        this._emitPaperPortfolioSnapshot()
         const bundle = this._symbolServices.get(symbol)
         this._persistSignalHistory({
           timestamp: Date.now(),
@@ -1350,6 +1464,7 @@ class FuturesAssetSocketAdapter {
             stream: 'paperTrade.opened',
             symbol,
           })
+          this._emitPaperPortfolioSnapshot()
 
           // If the restored position was auto-managed, also notify the state
           // machine so its transitions stay coherent.
@@ -1378,6 +1493,71 @@ class FuturesAssetSocketAdapter {
       .catch((err) => this.tradingPersistence.logPersistError('savePaperPosition', err))
   }
 
+  _emitPaperPortfolioSnapshot() {
+    try {
+      const openPositions = this.paperTradeService.getAllOpenPositions()
+      const closedPositions = this.paperTradeService.getClosedPositions()
+      const paper = this.portfolioManager?.getPaperAccountState?.() ?? {
+        startingEquity: this.scalpConfig?.account?.equity ?? 10_000,
+        realizedToDate: 0,
+        equity: this.scalpConfig?.account?.equity ?? 10_000,
+        bootstrapped: false,
+      }
+
+      const exposureBySymbol = {}
+      let totalNotional = 0
+      let totalUnrealized = 0
+      for (const position of openPositions) {
+        const qty = Number(position.quantity)
+        const effectiveQty = Number.isFinite(qty) && qty > 0 ? qty : 0
+        const notional = Number(position.entryPrice || 0) * effectiveQty
+        totalNotional += notional
+        exposureBySymbol[position.symbol] = (exposureBySymbol[position.symbol] || 0) + notional
+        totalUnrealized += Number(position.unrealizedPnl || 0)
+      }
+
+      const wins = closedPositions.filter((position) => Number(position.realizedPnl) > 0).length
+      const paperSummary = {
+        startingEquity: paper.startingEquity,
+        realizedToDate: paper.realizedToDate,
+        unrealizedPnl: totalUnrealized,
+        realizedPnl: paper.realizedToDate,
+        equity: paper.startingEquity + paper.realizedToDate + totalUnrealized,
+        openCount: openPositions.length,
+        closedCount: closedPositions.length,
+        wins,
+        winRate: closedPositions.length > 0 ? (wins / closedPositions.length) * 100 : 0,
+        exposureBySymbol,
+        totalNotional,
+        bootstrapped: paper.bootstrapped,
+      }
+
+      this.emitPortfolioSnapshot({
+        mode: 'paper',
+        positions: [],
+        livePositions: [],
+        paperPositions: [...openPositions, ...closedPositions],
+        totalNotional: 0,
+        exposureBySymbol: {},
+        totalUnrealized: 0,
+        totalRealized: 0,
+        dailyPnl: this.paperTradeService.getDailyPnl(),
+        liveSummary: {
+          openCount: 0,
+          totalNotional: 0,
+          unrealizedPnl: 0,
+          realizedPnl: 0,
+          exposureBySymbol: {},
+        },
+        paper,
+        paperSummary,
+        timestamp: Date.now(),
+      })
+    } catch (err) {
+      logger.warn(`[SocketAdapter] paper portfolio snapshot failed: ${err.message}`)
+    }
+  }
+
   _persistSignalHistory(entry) {
     if (!this.tradingPersistence || !entry) return
     this.tradingPersistence
@@ -1390,12 +1570,19 @@ class FuturesAssetSocketAdapter {
       .catch((err) => this.tradingPersistence.logPersistError('saveSignalHistory', err))
   }
 
+  _persistSessionCandle(snapshot) {
+    if (!this.tradingPersistence || !snapshot) return
+    this.tradingPersistence
+      .saveSessionCandle(snapshot)
+      .catch((err) => this.tradingPersistence.logPersistError('saveSessionCandle', err))
+  }
+
   _emitFootprintInit(socket, symbol) {
     const bundle = this._symbolServices.get(symbol)
     if (!bundle) return
     const footprints = {}
-    for (const [interval, svc] of bundle.footprints) {
-      footprints[interval] = svc.getHistory(100).map((c) => c.toPlainObject())
+    for (const interval of bundle.sessionCandles.getCandleHistoryMap().keys()) {
+      footprints[interval] = bundle.sessionCandles.getFootprintPlainHistory(interval, 100)
     }
     this._emitToSocket(
       socket,
@@ -1403,6 +1590,66 @@ class FuturesAssetSocketAdapter {
       { symbol, footprints },
       { stream: 'orderflow.footprint.init', symbol },
     )
+  }
+
+  _emitSessionCandleInit(socket, symbol) {
+    const bundle = this._symbolServices.get(symbol)
+    if (!bundle) return
+
+    for (const interval of bundle.sessionCandles.getCandleHistoryMap().keys()) {
+      const history = bundle.sessionCandles.getHistory(interval)
+      for (const candle of history) {
+        this._emitToSocket(
+          socket,
+          FUTURES_SOCKET_EVENTS.MARKET_CANDLE,
+          {
+            ...candle,
+            symbol: candle.symbol ?? symbol,
+            interval: candle.interval ?? interval,
+            isFinal: candle.isFinal ?? true,
+          },
+          {
+            stream: `market.candle.${interval}.init`,
+            symbol,
+            exchangeEventTime: extractExchangeEventTime(candle),
+          },
+        )
+      }
+
+      const snapshot = bundle.sessionCandles.getSnapshot(interval)
+      const compactSnapshot = snapshot?.footprint
+        ? { ...snapshot, footprint: compactFootprintForWire(snapshot.footprint) }
+        : snapshot
+      this._emitToSocket(socket, FUTURES_SOCKET_EVENTS.SESSION_CANDLE_SNAPSHOT, compactSnapshot, {
+        stream: `session.candle.${interval}.init`,
+        symbol,
+      })
+      if (snapshot?.indicators) {
+        this._emitToSocket(socket, FUTURES_SOCKET_EVENTS.MARKET_INDICATORS, snapshot.indicators, {
+          stream: `market.indicators.${interval}.init`,
+          symbol,
+        })
+      }
+    }
+  }
+
+  _emitDecisionTape(symbol, room, bundle) {
+    if (!bundle?._lastBookMetrics) return
+    const nowMs = Date.now()
+    if (bundle._lastDecisionTapeEmitAt && nowMs - bundle._lastDecisionTapeEmitAt < DECISION_TAPE_EMIT_MS) return
+    bundle._lastDecisionTapeEmitAt = nowMs
+    const payload = this.decisionTapeService.compute({
+      symbol,
+      interval: bundle.signalEngine?.interval ?? '1m',
+      bookMetrics: bundle._lastBookMetrics,
+      cvdHistory: bundle._recentCvdHistory.toArray(),
+      spoofingCandidates: bundle._recentSpoofingCandidates.toArray(),
+      liquidityShifts: bundle._recentLiquidityShifts.toArray(),
+    })
+    this._emitToRoom(room, FUTURES_SOCKET_EVENTS.DECISION_TAPE, payload, {
+      stream: 'decision.tape',
+      symbol,
+    })
   }
 
   getSymbolHealth(symbol) {
@@ -1434,6 +1681,85 @@ function buildSharedOrderBookContext(ob) {
     ? allQtys[mid - 1].plus(allQtys[mid]).div(2)
     : allQtys[mid]
   return { medianQty }
+}
+
+function classifyTradeSize(qty, recentQtys = []) {
+  const values = recentQtys.map(Number).filter((n) => Number.isFinite(n) && n > 0)
+  if (values.length < 5) return 'medium'
+  const mean = values.reduce((a, b) => a + b, 0) / values.length
+  const variance = values.reduce((acc, v) => acc + (v - mean) ** 2, 0) / values.length
+  const std = Math.sqrt(variance)
+  if (qty >= mean + 2 * std) return 'large'
+  if (qty >= mean + 0.5 * std) return 'medium'
+  return 'small'
+}
+
+function enrichTrade(trade, recentQtys = []) {
+  const price = Number(trade?.price)
+  const qty = Number(trade?.qty ?? trade?.quantity)
+  const notional = Number.isFinite(price) && Number.isFinite(qty) ? price * qty : null
+  const side = trade?.isBuyerMaker ? 'sell' : 'buy'
+  return {
+    ...trade,
+    side,
+    priceNumber: Number.isFinite(price) ? price : null,
+    qtyNumber: Number.isFinite(qty) ? qty : null,
+    notional,
+    sizeClass: Number.isFinite(qty) ? classifyTradeSize(qty, recentQtys) : 'medium',
+  }
+}
+
+function compactBookForWire(book) {
+  if (!book) return book
+  return {
+    ...book,
+    bids: Array.isArray(book.bids) ? book.bids.slice(0, WIRE_BOOK_LEVELS) : [],
+    asks: Array.isArray(book.asks) ? book.asks.slice(0, WIRE_BOOK_LEVELS) : [],
+  }
+}
+
+function compactFootprintForWire(footprint) {
+  if (!footprint || !Array.isArray(footprint.levels)) return footprint
+  if (footprint.levels.length <= WIRE_FOOTPRINT_LEVELS) return footprint
+  const pocIndex = footprint.levels.findIndex((level) => level?.isPoc)
+  if (pocIndex < 0) {
+    return { ...footprint, levels: footprint.levels.slice(-WIRE_FOOTPRINT_LEVELS) }
+  }
+  const half = Math.floor(WIRE_FOOTPRINT_LEVELS / 2)
+  const start = Math.max(0, pocIndex - half)
+  return { ...footprint, levels: footprint.levels.slice(start, start + WIRE_FOOTPRINT_LEVELS) }
+}
+
+function mergeCandlesByOpenTime(primary = [], secondary = []) {
+  const byOpenTime = new Map()
+  for (const candle of [...primary, ...secondary]) {
+    const openTime = Number(candle?.openTime)
+    if (!Number.isFinite(openTime)) continue
+    byOpenTime.set(openTime, candle)
+  }
+  return Array.from(byOpenTime.values()).sort((a, b) => Number(a.openTime) - Number(b.openTime))
+}
+
+function compactSignalFactors(factors = {}) {
+  if (!factors || typeof factors !== 'object') return null
+  return {
+    price: factors.price ?? null,
+    atr: factors.atr ?? null,
+    atrPct: factors.atrPct ?? null,
+    recentRangeBps: factors.recentRangeBps ?? null,
+    spreadPct: factors.spreadPct ?? null,
+    imbalance: factors.imbalance ?? null,
+    cvdFlowRatio: factors.cvdFlowRatio ?? null,
+    ema20: factors.ema20 ?? null,
+    ema50: factors.ema50 ?? null,
+    rsi: factors.rsi ?? null,
+    macdHistogram: factors.macdHistogram ?? null,
+    bidWallNearMid: Boolean(factors.bidWallNearMid),
+    askWallNearMid: Boolean(factors.askWallNearMid),
+    recentSpoofingBid: Boolean(factors.recentSpoofingBid),
+    recentSpoofingAsk: Boolean(factors.recentSpoofingAsk),
+    reversalContext: factors.reversalContext ?? null,
+  }
 }
 
 module.exports = { FuturesAssetSocketAdapter }

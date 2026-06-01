@@ -70,6 +70,14 @@ class CvdService {
     const isBuy    = !trade.isBuyerMaker
     const buckets  = this._updateBuckets(qty, isBuy, now)
 
+    const point = {
+      time: now,
+      cvd: Number(this._cvd.toFixed(4)),
+      delta: Number(delta.toFixed(4)),
+      price: String(trade.price),
+      side: isBuy ? 'buy' : 'sell',
+    }
+
     return {
       cvd:     this._cvd.toFixed(4),
       delta:   delta.toFixed(4),
@@ -77,6 +85,7 @@ class CvdService {
       side:    isBuy ? 'buy' : 'sell',
       time:    now,
       buckets,
+      point,
     }
   }
 

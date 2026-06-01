@@ -3,6 +3,7 @@
 const { isMongoConnected } = require('../db/mongoose')
 const { PaperPositionModel } = require('./mongoose/models/PaperPositionModel')
 const { SignalHistoryModel } = require('./mongoose/models/SignalHistoryModel')
+const { SessionCandleModel } = require('./mongoose/models/SessionCandleModel')
 const { logger } = require('../../shared/utils/logger')
 const { metrics } = require('../observability/metrics')
 
@@ -14,6 +15,8 @@ const SIGNAL_BUFFER_MAX = Number(process.env.MONGO_SIGNAL_BUFFER_MAX ?? 50)
 const SIGNAL_FLUSH_INTERVAL_MS = Number(process.env.MONGO_SIGNAL_FLUSH_MS ?? 500)
 const POSITION_BUFFER_MAX = Number(process.env.MONGO_POSITION_BUFFER_MAX ?? 25)
 const POSITION_FLUSH_INTERVAL_MS = Number(process.env.MONGO_POSITION_FLUSH_MS ?? 250)
+const SESSION_CANDLE_BUFFER_MAX = Number(process.env.MONGO_SESSION_CANDLE_BUFFER_MAX ?? 50)
+const SESSION_CANDLE_FLUSH_INTERVAL_MS = Number(process.env.MONGO_SESSION_CANDLE_FLUSH_MS ?? 500)
 
 class MongoTradingPersistenceService {
   constructor() {
@@ -21,6 +24,8 @@ class MongoTradingPersistenceService {
     this._signalFlushTimer = null
     this._positionBuffer = new Map() // positionId → latest doc (last-write-wins)
     this._positionFlushTimer = null
+    this._sessionCandleBuffer = new Map()
+    this._sessionCandleFlushTimer = null
     this._disposed = false
   }
 
@@ -109,12 +114,45 @@ class MongoTradingPersistenceService {
       orderBookSnapshotId: entry.orderBookSnapshotId ?? null,
       cvdSnapshotId: entry.cvdSnapshotId ?? null,
       footprintSnapshotId: entry.footprintSnapshotId ?? null,
+      signalRisk: entry.signalRisk ?? null,
+      adjustedRisk: entry.adjustedRisk ?? null,
+      autoExecution: entry.autoExecution ?? null,
+      factorsSummary: entry.factorsSummary ?? null,
     }
     this._signalBuffer.push(doc)
     if (this._signalBuffer.length >= SIGNAL_BUFFER_MAX) {
       await this._flushSignals()
     } else {
       this._scheduleSignalFlush()
+    }
+    return doc
+  }
+
+  async saveSessionCandle(snapshot) {
+    if (!this.isEnabled() || !snapshot?.symbol || !snapshot?.interval || snapshot?.openTime == null) return null
+
+    const doc = {
+      sessionId: snapshot.sessionId ?? 'default',
+      symbol: snapshot.symbol,
+      interval: snapshot.interval,
+      openTime: Number(snapshot.openTime),
+      closeTime: snapshot.closeTime == null ? null : Number(snapshot.closeTime),
+      open: snapshot.open == null ? null : String(snapshot.open),
+      high: snapshot.high == null ? null : String(snapshot.high),
+      low: snapshot.low == null ? null : String(snapshot.low),
+      close: snapshot.close == null ? null : String(snapshot.close),
+      volume: snapshot.volume == null ? null : String(snapshot.volume),
+      isFinal: Boolean(snapshot.isFinal),
+      indicators: snapshot.indicators ?? null,
+      footprintSummary: snapshot.footprintSummary ?? null,
+    }
+
+    const key = `${doc.sessionId}:${doc.symbol}:${doc.interval}:${doc.openTime}`
+    this._sessionCandleBuffer.set(key, doc)
+    if (this._sessionCandleBuffer.size >= SESSION_CANDLE_BUFFER_MAX) {
+      await this._flushSessionCandles()
+    } else {
+      this._scheduleSessionCandleFlush()
     }
     return doc
   }
@@ -142,6 +180,41 @@ class MongoTradingPersistenceService {
     }
   }
 
+  _scheduleSessionCandleFlush() {
+    if (this._sessionCandleFlushTimer || this._disposed) return
+    this._sessionCandleFlushTimer = setTimeout(() => {
+      this._sessionCandleFlushTimer = null
+      this._flushSessionCandles().catch((err) => this.logPersistError('sessionCandles-flush', err))
+    }, SESSION_CANDLE_FLUSH_INTERVAL_MS)
+    if (this._sessionCandleFlushTimer.unref) this._sessionCandleFlushTimer.unref()
+  }
+
+  async _flushSessionCandles() {
+    if (this._sessionCandleBuffer.size === 0) return
+    const docs = Array.from(this._sessionCandleBuffer.values())
+    this._sessionCandleBuffer.clear()
+    const t0 = Date.now()
+    try {
+      const ops = docs.map((doc) => ({
+        updateOne: {
+          filter: {
+            sessionId: doc.sessionId,
+            symbol: doc.symbol,
+            interval: doc.interval,
+            openTime: doc.openTime,
+          },
+          update: { $set: doc },
+          upsert: true,
+        },
+      }))
+      await SessionCandleModel.bulkWrite(ops, { ordered: false })
+      metrics.mongoWriteMs.observe({ op: 'sessionCandle.bulk' }, Date.now() - t0)
+    } catch (err) {
+      metrics.mongoErrors.inc({ op: 'sessionCandle.bulk' })
+      throw err
+    }
+  }
+
   /**
    * Force-flush all buffered writes. Call on shutdown.
    */
@@ -149,6 +222,7 @@ class MongoTradingPersistenceService {
     const tasks = []
     if (this._signalBuffer.length > 0) tasks.push(this._flushSignals())
     if (this._positionBuffer.size > 0) tasks.push(this._flushPositions())
+    if (this._sessionCandleBuffer.size > 0) tasks.push(this._flushSessionCandles())
     await Promise.allSettled(tasks)
   }
 
@@ -156,8 +230,10 @@ class MongoTradingPersistenceService {
     this._disposed = true
     if (this._signalFlushTimer) clearTimeout(this._signalFlushTimer)
     if (this._positionFlushTimer) clearTimeout(this._positionFlushTimer)
+    if (this._sessionCandleFlushTimer) clearTimeout(this._sessionCandleFlushTimer)
     this._signalFlushTimer = null
     this._positionFlushTimer = null
+    this._sessionCandleFlushTimer = null
     await this.flush()
   }
 
@@ -211,6 +287,31 @@ class MongoTradingPersistenceService {
     const [items, total] = await Promise.all([
       SignalHistoryModel.find(q).sort({ timestamp: -1 }).skip(skip).limit(safeLimit).lean(),
       SignalHistoryModel.countDocuments(q),
+    ])
+
+    return { items, total, page: safePage, limit: safeLimit }
+  }
+
+  async listSessionCandles({ sessionId = 'default', symbol, interval = '1m', from, to, limit = 100, page = 1 }) {
+    if (!this.isEnabled()) return { items: [], total: 0, page, limit }
+
+    await this._flushSessionCandles().catch(() => {})
+
+    const q = { sessionId, interval }
+    if (symbol) q.symbol = symbol.toUpperCase()
+    if (from != null || to != null) {
+      q.openTime = {}
+      if (from != null) q.openTime.$gte = Number(from)
+      if (to != null) q.openTime.$lte = Number(to)
+    }
+
+    const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 1000))
+    const safePage = Math.max(1, Number(page) || 1)
+    const skip = (safePage - 1) * safeLimit
+
+    const [items, total] = await Promise.all([
+      SessionCandleModel.find(q).sort({ openTime: -1 }).skip(skip).limit(safeLimit).lean(),
+      SessionCandleModel.countDocuments(q),
     ])
 
     return { items, total, page: safePage, limit: safeLimit }

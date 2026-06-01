@@ -5,6 +5,7 @@ function isFiniteNumber(value) {
 }
 
 function normalizeNumber(value) {
+  if (value == null || value === '') return null
   return isFiniteNumber(value) ? Number(value) : null
 }
 
@@ -12,11 +13,17 @@ function buildPositionId(symbol) {
   return `paper-${symbol}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-function calculateUnrealizedPnl(direction, entryPrice, currentPrice) {
+function effectiveQuantity(quantity) {
+  const qty = Number(quantity)
+  return Number.isFinite(qty) && qty > 0 ? qty : 1
+}
+
+function calculateUnrealizedPnl(direction, entryPrice, currentPrice, quantity = 1) {
   if (!isFiniteNumber(entryPrice) || !isFiniteNumber(currentPrice)) return null
   const entry = Number(entryPrice)
   const current = Number(currentPrice)
-  return direction === 'SHORT' ? entry - current : current - entry
+  const perUnit = direction === 'SHORT' ? entry - current : current - entry
+  return perUnit * effectiveQuantity(quantity)
 }
 
 class PaperTradeService {
@@ -137,7 +144,7 @@ class PaperTradeService {
 
     const existing = symbolMap.get(positionId)
     const price = isFiniteNumber(closePrice) ? Number(closePrice) : existing.currentPrice
-    const realizedPnl = calculateUnrealizedPnl(existing.direction, existing.entryPrice, price)
+    const realizedPnl = calculateUnrealizedPnl(existing.direction, existing.entryPrice, price, existing.quantity)
 
     const closed = {
       ...existing,
@@ -186,7 +193,12 @@ class PaperTradeService {
     const output = []
     for (const position of symbolMap.values()) {
       const nextPrice = Number(price)
-      const nextUnrealizedPnl = calculateUnrealizedPnl(position.direction, position.entryPrice, nextPrice)
+      const nextUnrealizedPnl = calculateUnrealizedPnl(
+        position.direction,
+        position.entryPrice,
+        nextPrice,
+        position.quantity,
+      )
       position.currentPrice = nextPrice
       position.unrealizedPnl = nextUnrealizedPnl
 
@@ -244,6 +256,26 @@ class PaperTradeService {
     const symbolMap = this._openBySymbol.get(normalizedSymbol)
     if (!symbolMap) return []
     return Array.from(symbolMap.values()).map((position) => ({ ...position }))
+  }
+
+  getAllOpenPositions() {
+    const positions = []
+    for (const symbolMap of this._openBySymbol.values()) {
+      for (const position of symbolMap.values()) positions.push({ ...position })
+    }
+    return positions
+  }
+
+  getClosedPositions(symbol = null) {
+    const normalizedSymbol = symbol == null ? null : (symbol ?? '').trim().toUpperCase()
+    if (normalizedSymbol) {
+      return (this._closedBySymbol.get(normalizedSymbol) ?? []).map((position) => ({ ...position }))
+    }
+    const positions = []
+    for (const list of this._closedBySymbol.values()) {
+      for (const position of list) positions.push({ ...position })
+    }
+    return positions
   }
 
   /**

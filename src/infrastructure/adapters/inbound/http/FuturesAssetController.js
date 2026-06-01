@@ -211,6 +211,32 @@ class FuturesAssetController {
       return this._handleError(res, err)
     }
   }
+
+  /**
+   * GET /api/futures/session-candles?symbol=BTCUSDT&interval=1m&from=...&to=...
+   */
+  async getSessionCandles(req, res) {
+    if (!this.tradingPersistence) {
+      return res.status(503).json({ error: 'Persistence is not available' })
+    }
+
+    const { sessionId = 'default', symbol, interval = '1m', from, to, limit = 100, page = 1 } = req.query
+
+    try {
+      const result = await this.tradingPersistence.listSessionCandles({
+        sessionId,
+        symbol,
+        interval,
+        from,
+        to,
+        limit,
+        page,
+      })
+      return res.json(result)
+    } catch (err) {
+      return this._handleError(res, err)
+    }
+  }
 }
 
 module.exports = { FuturesAssetController }

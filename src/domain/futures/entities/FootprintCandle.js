@@ -133,19 +133,34 @@ class FootprintCandle {
   /** Plain serialisable object safe to emit over Socket.IO. */
   toPlainObject() {
     const levels = []
+    let pocPrice = null
+    let pocVolume = new Decimal(-1)
+    let totalDelta = new Decimal(0)
+
     for (const [price, { buyVol, sellVol }] of this.levels) {
       const total = buyVol.plus(sellVol)
       const delta = buyVol.minus(sellVol)
+      const imbalance = total.gt(0) ? delta.div(total) : new Decimal(0)
+      totalDelta = totalDelta.plus(delta)
+      if (total.gt(pocVolume)) {
+        pocVolume = total
+        pocPrice = price
+      }
       levels.push({
         price,
         buyVol:  buyVol.toFixed(4),
         sellVol: sellVol.toFixed(4),
         total:   total.toFixed(4),
         delta:   delta.toFixed(4),
+        imbalance: imbalance.toFixed(4),
+        isPoc: false,
       })
     }
     // Sort ascending by price
     levels.sort((a, b) => new Decimal(a.price).cmp(new Decimal(b.price)))
+    for (const level of levels) {
+      level.isPoc = level.price === pocPrice
+    }
 
     return {
       symbol:   this.symbol,
@@ -158,6 +173,8 @@ class FootprintCandle {
       volume:   this.volume.toFixed(4),
       isFinal:  this.isFinal,
       levels,
+      poc:       pocPrice,
+      totalDelta: totalDelta.toFixed(4),
     }
   }
 }

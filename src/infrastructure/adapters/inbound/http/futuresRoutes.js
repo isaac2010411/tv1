@@ -54,6 +54,12 @@ const createFuturesAssetRouter = (controller) => {
    */
   router.get('/signal-history', (req, res) => controller.getSignalHistory(req, res))
 
+  /**
+   * GET /api/futures/session-candles?symbol=BTCUSDT&interval=1m&limit=200
+   * Returns persisted session candles with backend-calculated indicators.
+   */
+  router.get('/session-candles', (req, res) => controller.getSessionCandles(req, res))
+
   return router
 }
 

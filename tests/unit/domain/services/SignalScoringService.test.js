@@ -20,18 +20,35 @@ const fullBullishFactors = {
   missingContext: [],
 }
 
+const sumWeights = (weights) => Object.values(weights).reduce((sum, weight) => sum + weight, 0)
+
 describe('SignalScoringService — horizon profiles', () => {
-  test('default profile preserves existing weights', () => {
-    expect(WEIGHTS.imbalance).toBe(0.22)
-    expect(WEIGHTS.cvdFlowRatio).toBe(0.20)
-    expect(WEIGHTS.ema20VsEma50).toBe(0.10)
+  test('default profile uses normalized profitability-adjusted weights', () => {
+    expect(WEIGHTS.imbalance).toBe(0.2016)
+    expect(WEIGHTS.cvdFlowRatio).toBe(0.1774)
+    expect(WEIGHTS.priceVsEma20).toBe(0.0645)
+    expect(WEIGHTS.ema20VsEma50).toBe(0.1129)
+    expect(WEIGHTS.rsi).toBe(0.0645)
+    expect(WEIGHTS.macdHistogram).toBe(0.0645)
+    expect(WEIGHTS.bidWallNearMid).toBe(0.0645)
+    expect(WEIGHTS.askWallNearMid).toBe(0.0645)
+    expect(WEIGHTS.spoofing).toBe(0.0242)
+    expect(WEIGHTS.reversalContext).toBe(0.1614)
+    expect(sumWeights(WEIGHTS)).toBeCloseTo(1, 4)
   })
 
-  test('scalp profile up-weights order flow and down-weights EMA/MACD', () => {
+  test('scalp profile up-weights order flow/reversal and stays normalized', () => {
+    expect(WEIGHTS_SCALP.imbalance).toBe(0.26)
+    expect(WEIGHTS_SCALP.cvdFlowRatio).toBe(0.24)
+    expect(WEIGHTS_SCALP.priceVsEma20).toBe(0.04)
+    expect(WEIGHTS_SCALP.ema20VsEma50).toBe(0.08)
+    expect(WEIGHTS_SCALP.rsi).toBe(0.03)
     expect(WEIGHTS_SCALP.imbalance).toBeGreaterThan(WEIGHTS.imbalance)
     expect(WEIGHTS_SCALP.cvdFlowRatio).toBeGreaterThan(WEIGHTS.cvdFlowRatio)
+    expect(WEIGHTS_SCALP.reversalContext).toBeGreaterThan(WEIGHTS.reversalContext)
     expect(WEIGHTS_SCALP.ema20VsEma50).toBeLessThan(WEIGHTS.ema20VsEma50)
     expect(WEIGHTS_SCALP.macdHistogram).toBeLessThan(WEIGHTS.macdHistogram)
+    expect(sumWeights(WEIGHTS_SCALP)).toBeCloseTo(1, 4)
   })
 
   test('default horizon scoring is unchanged when opts omitted', () => {

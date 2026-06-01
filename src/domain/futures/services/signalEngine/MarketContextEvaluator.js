@@ -122,6 +122,19 @@ function computeATR(candles, period = 14) {
   return atr
 }
 
+function computeRecentRangeBps(candles, price, lookbackBars = 12) {
+  const refPrice = Number(price)
+  if (!Array.isArray(candles) || candles.length === 0 || !Number.isFinite(refPrice) || refPrice <= 0) return null
+  const window = candles.slice(-lookbackBars)
+  const highs = window.map((c) => Number(c.high)).filter(Number.isFinite)
+  const lows = window.map((c) => Number(c.low)).filter(Number.isFinite)
+  if (highs.length === 0 || lows.length === 0) return null
+  const high = Math.max(...highs)
+  const low = Math.min(...lows)
+  if (!Number.isFinite(high) || !Number.isFinite(low) || high <= low) return null
+  return +(((high - low) / refPrice) * 10_000).toFixed(2)
+}
+
 /**
  * CVD flow ratio from recent CVD history.
  * Ratio = buyVolume / (buyVolume + sellVolume) over the last `windowSize` items.
@@ -326,6 +339,7 @@ function evaluateMarketContext({ orderBook, candleHistory, cvdHistory, spoofingC
   const rsi   = computeRSI(closes)
   const macdHistogram = computeMACD(closes)
   const atr   = computeATR(candles)
+  const recentRangeBps = computeRecentRangeBps(candles, price)
 
   if (closes.length < 50) missing.push('candles')
 
@@ -381,6 +395,7 @@ function evaluateMarketContext({ orderBook, candleHistory, cvdHistory, spoofingC
     rsi,
     macdHistogram,
     atr,
+    recentRangeBps,
     bidWallNearMid,
     askWallNearMid,
     recentSpoofingBid,
@@ -411,6 +426,7 @@ module.exports = {
   computeRSI,
   computeMACD,
   computeATR,
+  computeRecentRangeBps,
   computeCvdFlowRatio,
   detectReversalContext,
 }

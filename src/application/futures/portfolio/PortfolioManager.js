@@ -203,16 +203,34 @@ class PortfolioManager extends PortfolioManagerPort {
     for (const pos of this._positions.values()) {
       if (userId != null && (pos.userId ?? null) !== userId) continue
       positions.push({ ...pos })
+      totalRealized += Number(pos.realizedPnl || 0)
       if (pos.status === 'OPEN') {
         const notional = Number(pos.entryPrice || 0) * Number(pos.quantity || 0)
         totalNotional += notional
         exposureBySymbol[pos.symbol] = (exposureBySymbol[pos.symbol] || 0) + notional
         totalUnrealized += Number(pos.unrealizedPnl || 0)
-      } else {
-        totalRealized += Number(pos.realizedPnl || 0)
       }
     }
     const dailyPnl = (this._dailyRealized.get(this._today()) || 0) + totalUnrealized
+    const openPositions = positions.filter((p) => p.status === 'OPEN')
+    const closedPositions = positions.filter((p) => p.status === 'CLOSED')
+    const wins = closedPositions.filter((p) => Number(p.realizedPnl) > 0).length
+    const paper = this.getPaperAccountState()
+    const combinedRealized = paper.realizedToDate + totalRealized
+    const paperSummary = {
+      startingEquity: paper.startingEquity,
+      realizedToDate: paper.realizedToDate,
+      unrealizedPnl: totalUnrealized,
+      realizedPnl: combinedRealized,
+      equity: paper.startingEquity + combinedRealized + totalUnrealized,
+      openCount: openPositions.length,
+      closedCount: closedPositions.length,
+      wins,
+      winRate: closedPositions.length > 0 ? (wins / closedPositions.length) * 100 : 0,
+      exposureBySymbol,
+      totalNotional,
+      bootstrapped: paper.bootstrapped,
+    }
     return {
       positions,
       totalNotional,
@@ -220,7 +238,15 @@ class PortfolioManager extends PortfolioManagerPort {
       totalUnrealized,
       totalRealized,
       dailyPnl,
-      paper: this.getPaperAccountState(),
+      liveSummary: {
+        openCount: openPositions.length,
+        totalNotional,
+        unrealizedPnl: totalUnrealized,
+        realizedPnl: totalRealized,
+        exposureBySymbol,
+      },
+      paper,
+      paperSummary,
       timestamp: Date.now(),
     }
   }

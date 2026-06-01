@@ -13,16 +13,16 @@
  */
 
 const WEIGHTS = {
-  imbalance:     0.22,
-  cvdFlowRatio:  0.20,
-  priceVsEma20:  0.12,
-  ema20VsEma50:  0.10,
-  rsi:           0.14,
-  macdHistogram: 0.10,
-  bidWallNearMid: 0.12,
-  askWallNearMid: 0.12,
-  spoofing:       0.06,
-  reversalContext: 0.18,
+  imbalance:     0.2016,
+  cvdFlowRatio:  0.1774,
+  priceVsEma20:  0.0645,
+  ema20VsEma50:  0.1129,
+  rsi:           0.0645,
+  macdHistogram: 0.0645,
+  bidWallNearMid: 0.0645,
+  askWallNearMid: 0.0645,
+  spoofing:       0.0242,
+  reversalContext: 0.1614,
 }
 
 /**
@@ -34,16 +34,16 @@ const WEIGHTS = {
  * never single-handedly carry an entry.
  */
 const WEIGHTS_SCALP = {
-  imbalance:     0.28,
-  cvdFlowRatio:  0.25,
-  priceVsEma20:  0.07,
-  ema20VsEma50:  0.05,
-  rsi:           0.05,
-  macdHistogram: 0.05,
-  bidWallNearMid: 0.15,
-  askWallNearMid: 0.15,
-  spoofing:       0.10,
-  reversalContext: 0.30,
+  imbalance:     0.26,
+  cvdFlowRatio:  0.24,
+  priceVsEma20:  0.04,
+  ema20VsEma50:  0.08,
+  rsi:           0.03,
+  macdHistogram: 0.04,
+  bidWallNearMid: 0.04,
+  askWallNearMid: 0.04,
+  spoofing:       0.01,
+  reversalContext: 0.22,
 }
 
 const WEIGHT_PROFILES = Object.freeze({

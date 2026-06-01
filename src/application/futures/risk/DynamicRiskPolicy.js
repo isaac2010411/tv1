@@ -47,12 +47,16 @@ const POSITION_ACTION = Object.freeze({
  * require the expected TP move to be ≥ `edgeMultiple` × round-trip cost
  * before approving any AUTO entry.
  */
+// const DEFAULT_COSTS = Object.freeze({
+//   feeBps: 4,
+//   slippageBps: 2,
+//   edgeMultiple: 3, // require expected TP ≥ 3× round-trip cost
+// })
 const DEFAULT_COSTS = Object.freeze({
   feeBps: 4,
   slippageBps: 2,
-  edgeMultiple: 3, // require expected TP ≥ 3× round-trip cost
+  edgeMultiple: 2, // diagnóstico scalping 1m: permite TP esperado ~8-12 bps
 })
-
 /**
  * Compute recommended position size from equity, risk budget and stop distance.
  *
@@ -198,6 +202,9 @@ function evaluateSignal({ signal, factors = {}, position = null, accountState = 
   const executionMode = String(accountState?.executionMode || 'auto').toLowerCase() === 'semi'
     ? 'semi'
     : 'auto'
+  const horizon = String(accountState?.horizon || 'default').toLowerCase() === 'scalp'
+    ? 'scalp'
+    : 'default'
 
   // Dynamic thresholds — interpolated by regime.
   const minConfidenceBase = Math.round(55 + 25 * scale)        // 55 → 80 %
@@ -285,8 +292,25 @@ function evaluateSignal({ signal, factors = {}, position = null, accountState = 
   const price = Number(signal?.risk?.entryPrice ?? factors.price)
   const atr = Number(factors.atr)
   if (Number.isFinite(price) && Number.isFinite(atr) && atr > 0 && signal?.direction) {
+    const costs = accountState?.costs ?? null
+    const edgeMultipleBase = Number(costs?.edgeMultiple ?? DEFAULT_COSTS.edgeMultiple)
+    const edgeMultiple = reboundAligned
+      ? Math.min(edgeMultipleBase, 1)
+      : horizon === 'scalp'
+        ? Math.min(edgeMultipleBase, 1.1)
+        : edgeMultipleBase
+    const feeBps = Number(costs?.feeBps ?? DEFAULT_COSTS.feeBps)
+    const slipBps = Number(costs?.slippageBps ?? DEFAULT_COSTS.slippageBps)
+    const roundTripCostBps = 2 * (feeBps + slipBps)
+    const shouldExpandTp = horizon === 'scalp' || reboundAligned
+    const minCostTpBps = shouldExpandTp ? roundTripCostBps * edgeMultiple + 0.1 : 0
+    const recentRangeBps = Number(factors.recentRangeBps)
+    const recentRangeTpBps = shouldExpandTp && Number.isFinite(recentRangeBps)
+      ? Math.min(30, Math.max(0, recentRangeBps * (reboundAligned ? 0.35 : 0.25)))
+      : 0
+    const minDynamicTpBps = Math.max(minCostTpBps, recentRangeTpBps)
     const stopDist = atr * stopAtrMult
-    const tpDist = atr * tpAtrMult
+    const tpDist = Math.max(atr * tpAtrMult, price * minDynamicTpBps / 10_000)
     const stopLoss = signal.direction === 'long' ? price - stopDist : price + stopDist
     const takeProfit = signal.direction === 'long' ? price + tpDist : price - tpDist
     adjustedRisk = {
@@ -295,6 +319,8 @@ function evaluateSignal({ signal, factors = {}, position = null, accountState = 
       takeProfit: +takeProfit.toFixed(6),
       stopAtrMult: +stopAtrMult.toFixed(2),
       tpAtrMult: +tpAtrMult.toFixed(2),
+      minDynamicTpBps: +minDynamicTpBps.toFixed(2),
+      recentRangeBps: Number.isFinite(recentRangeBps) ? +recentRangeBps.toFixed(2) : null,
       riskReward: +minRiskReward.toFixed(2),
     }
 
@@ -302,15 +328,11 @@ function evaluateSignal({ signal, factors = {}, position = null, accountState = 
     // At 30s–1m horizons, round-trip fees + slippage routinely eat the entire
     // TP move on calm regimes. Require the expected TP move to clear a
     // multiple of the round-trip cost before allowing AUTO execution.
-    const costs = accountState?.costs ?? null
     const edge = computeNetEdgeBps({ entryPrice: price, takeProfit, costs: costs ?? undefined })
     adjustedRisk.expectedTpBps = edge.expectedTpBps
     adjustedRisk.roundTripCostBps = edge.roundTripCostBps
     adjustedRisk.netEdgeBps = edge.netEdgeBps
-    const edgeMultipleBase = Number(costs?.edgeMultiple ?? DEFAULT_COSTS.edgeMultiple)
-    // Mean-reversion rebounds take tight TPs near support/resistance; require
     // ~2× cost instead of 3× when the rebound context is aligned.
-    const edgeMultiple = reboundAligned ? Math.max(1.5, edgeMultipleBase - 1) : edgeMultipleBase
     const minTpBps = edge.roundTripCostBps * edgeMultiple
     if (edge.expectedTpBps < minTpBps) {
       reasons.push(`Expected TP ${edge.expectedTpBps}bps < required ${minTpBps.toFixed(2)}bps (cost edge)`)

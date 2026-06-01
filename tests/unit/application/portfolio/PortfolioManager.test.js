@@ -75,4 +75,30 @@ describe('PortfolioManager.getSnapshot', () => {
     expect(snap.exposureBySymbol).toEqual({ BTCUSDT: 100, ETHUSDT: 100 })
     expect(snap.positions).toHaveLength(2)
   })
+
+  test('counts realized pnl from partial closes while the position remains open', async () => {
+    const pm = new PortfolioManager({ startingEquity: 10_000 })
+    await pm.applyFill(makeFill({ side: 'BUY', quantity: 5, price: 100 }))
+    await pm.applyFill(makeFill({ side: 'SELL', quantity: 2, price: 120 }))
+
+    const snap = await pm.getSnapshot()
+
+    expect(snap.totalRealized).toBe(40)
+    expect(snap.totalUnrealized).toBe(60)
+    expect(snap.liveSummary.realizedPnl).toBe(40)
+    expect(snap.paperSummary.realizedPnl).toBe(40)
+    expect(snap.paperSummary.equity).toBe(10_100)
+  })
+
+  test('includes fully closed realized pnl in paper summary equity', async () => {
+    const pm = new PortfolioManager({ startingEquity: 10_000 })
+    await pm.applyFill(makeFill({ side: 'BUY', quantity: 2, price: 100 }))
+    await pm.applyFill(makeFill({ side: 'SELL', quantity: 2, price: 150 }))
+
+    const snap = await pm.getSnapshot()
+
+    expect(snap.totalRealized).toBe(100)
+    expect(snap.paperSummary.realizedPnl).toBe(100)
+    expect(snap.paperSummary.equity).toBe(10_100)
+  })
 })

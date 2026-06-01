@@ -66,4 +66,28 @@ describe('PaperTradeService', () => {
     expect(closed.position.closeReason).toBe('STOP_LOSS')
     expect(closed.position.realizedPnl).toBe(-4)
   })
+
+  test('scales unrealized and realized pnl by quantity', () => {
+    const svc = new PaperTradeService()
+    const opened = svc.openPosition({
+      symbol: 'BTCUSDT',
+      userId: 'u1',
+      direction: 'LONG',
+      entryPrice: 100,
+      quantity: 3,
+    })
+
+    const [updated] = svc.onPriceTick({ symbol: 'BTCUSDT', price: 102 })
+    const closed = svc.closePosition({
+      symbol: 'BTCUSDT',
+      positionId: opened.id,
+      closePrice: 105,
+      closeReason: 'MANUAL',
+    })
+
+    expect(updated.position.unrealizedPnl).toBe(6)
+    expect(closed.realizedPnl).toBe(15)
+    expect(svc.getAllOpenPositions()).toHaveLength(0)
+    expect(svc.getClosedPositions('BTCUSDT')).toHaveLength(1)
+  })
 })

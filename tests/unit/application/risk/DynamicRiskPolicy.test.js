@@ -106,6 +106,51 @@ describe('evaluateSignal — cost-aware gate & sizing', () => {
     expect(result.adjustedRisk.expectedTpBps).toBeGreaterThan(0)
     expect(result.adjustedRisk.roundTripCostBps).toBe(12)
   })
+
+  test('allows aligned rebound when TP covers cost but not the configured multiple', () => {
+    const result = evaluateSignal({
+      signal: baseSignal(),
+      factors: {
+        ...baseFactors,
+        atr: 0.021,
+        reversalContext: { active: true, direction: 'long', strength: 1 },
+      },
+      accountState: {
+        costs: { feeBps: 1.5, slippageBps: 0.6, edgeMultiple: 2 },
+      },
+    })
+    expect(result.rule).not.toBe('costEdge')
+    expect(result.adjustedRisk.expectedTpBps).toBeGreaterThanOrEqual(result.adjustedRisk.roundTripCostBps)
+    expect(result.adjustedRisk.expectedTpBps).toBeLessThan(result.adjustedRisk.roundTripCostBps * 2)
+  })
+
+  test('uses a smaller cost buffer for scalp horizon', () => {
+    const result = evaluateSignal({
+      signal: baseSignal(),
+      factors: { ...baseFactors, atr: 0.022 },
+      accountState: {
+        horizon: 'scalp',
+        costs: { feeBps: 1.5, slippageBps: 0.6, edgeMultiple: 2 },
+      },
+    })
+    expect(result.rule).not.toBe('costEdge')
+    expect(result.adjustedRisk.expectedTpBps).toBeGreaterThanOrEqual(result.adjustedRisk.roundTripCostBps * 1.1)
+    expect(result.adjustedRisk.expectedTpBps).toBeLessThan(result.adjustedRisk.roundTripCostBps * 2)
+  })
+
+  test('expands scalp TP from recent candle range when ATR target is too small', () => {
+    const result = evaluateSignal({
+      signal: baseSignal(),
+      factors: { ...baseFactors, atr: 0.01, recentRangeBps: 60 },
+      accountState: {
+        horizon: 'scalp',
+        costs: { feeBps: 1.5, slippageBps: 0.6, edgeMultiple: 2 },
+      },
+    })
+    expect(result.rule).not.toBe('costEdge')
+    expect(result.adjustedRisk.expectedTpBps).toBeGreaterThanOrEqual(15)
+    expect(result.adjustedRisk.recentRangeBps).toBe(60)
+  })
 })
 
 describe('evaluateActivePosition — time-stop', () => {

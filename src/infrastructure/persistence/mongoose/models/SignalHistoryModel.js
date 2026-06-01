@@ -33,6 +33,10 @@ const SignalHistorySchema = new mongoose.Schema(
     orderBookSnapshotId: { type: String, default: null },
     cvdSnapshotId: { type: String, default: null },
     footprintSnapshotId: { type: String, default: null },
+    signalRisk: { type: mongoose.Schema.Types.Mixed, default: null },
+    adjustedRisk: { type: mongoose.Schema.Types.Mixed, default: null },
+    autoExecution: { type: mongoose.Schema.Types.Mixed, default: null },
+    factorsSummary: { type: mongoose.Schema.Types.Mixed, default: null },
   },
   {
     timestamps: true,
