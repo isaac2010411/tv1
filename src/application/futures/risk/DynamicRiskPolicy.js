@@ -26,9 +26,9 @@ const REGIME = Object.freeze({
 })
 
 const SIGNAL_MODE = Object.freeze({
-  AUTO: 'AUTO',         // RiskManager auto-opens the position
-  MANUAL: 'MANUAL',     // popup shown, user must accept
-  REJECT: 'REJECT',     // popup shown only as info / no entry allowed
+  AUTO: 'AUTO', // RiskManager auto-opens the position
+  MANUAL: 'MANUAL', // popup shown, user must accept
+  REJECT: 'REJECT', // popup shown only as info / no entry allowed
 })
 
 const POSITION_ACTION = Object.freeze({
@@ -86,7 +86,13 @@ function computePositionSize({
   const entry = Number(entryPrice)
   const stop = Number(stopLoss)
   const stopDistance = Number.isFinite(entry) && Number.isFinite(stop) ? Math.abs(entry - stop) : 0
-  if (!Number.isFinite(eq) || eq <= 0 || stopDistance <= 0 || !Number.isFinite(contractMultiplier) || contractMultiplier <= 0) {
+  if (
+    !Number.isFinite(eq) ||
+    eq <= 0 ||
+    stopDistance <= 0 ||
+    !Number.isFinite(contractMultiplier) ||
+    contractMultiplier <= 0
+  ) {
     return { quantity: 0, riskAmount: 0, stopDistance }
   }
   const riskAmount = eq * Math.max(0, Math.min(1, riskPerTradePct))
@@ -130,7 +136,7 @@ function computeNetEdgeBps({ entryPrice, takeProfit, costs = DEFAULT_COSTS } = {
 function classifyRegime(atrPct) {
   if (!Number.isFinite(atrPct) || atrPct <= 0) return REGIME.NORMAL
   if (atrPct < 0.0015) return REGIME.CALM
-  if (atrPct < 0.0050) return REGIME.NORMAL
+  if (atrPct < 0.005) return REGIME.NORMAL
   return REGIME.VOLATILE
 }
 
@@ -199,17 +205,13 @@ function evaluateSignal({ signal, factors = {}, position = null, accountState = 
   // hard risk gates. 'semi' ⇒ keep the legacy popup flow for soft-fail
   // signals so the human can approve them. Hard gates (spread, cost edge,
   // open position, daily-loss brake) always block regardless of mode.
-  const executionMode = String(accountState?.executionMode || 'auto').toLowerCase() === 'semi'
-    ? 'semi'
-    : 'auto'
-  const horizon = String(accountState?.horizon || 'default').toLowerCase() === 'scalp'
-    ? 'scalp'
-    : 'default'
+  const executionMode = String(accountState?.executionMode || 'auto').toLowerCase() === 'semi' ? 'semi' : 'auto'
+  const horizon = String(accountState?.horizon || 'default').toLowerCase() === 'scalp' ? 'scalp' : 'default'
 
   // Dynamic thresholds — interpolated by regime.
-  const minConfidenceBase = Math.round(55 + 25 * scale)        // 55 → 80 %
-  const minRiskRewardBase = +(1.5 + 0.7 * scale).toFixed(2)    // 1.50 → 2.20
-  const stopAtrMult = 1.2 + 0.6 * scale                        // 1.2 → 1.8 × ATR
+  const minConfidenceBase = Math.round(55 + 25 * scale) // 55 → 80 %
+  const minRiskRewardBase = +(1.5 + 0.7 * scale).toFixed(2) // 1.50 → 2.20
+  const stopAtrMult = 1.2 + 0.6 * scale // 1.2 → 1.8 × ATR
   const tpAtrMult = stopAtrMult * minRiskRewardBase
 
   // Order-flow rebound context: when the evaluator confirmed a technical
@@ -217,14 +219,9 @@ function evaluateSignal({ signal, factors = {}, position = null, accountState = 
   // edge so the bot can react. Pure mean-reversion scalps trade tight TPs and
   // tend to fail the standard 3× cost gate built for trend continuation.
   const rebound = factors.reversalContext
-  const reboundAligned = !!(rebound && rebound.active && signal?.direction &&
-                            rebound.direction === signal.direction)
-  const minConfidence = reboundAligned
-    ? Math.max(40, minConfidenceBase - 10)
-    : minConfidenceBase
-  const minRiskReward = reboundAligned
-    ? Math.max(1.2, +(minRiskRewardBase - 0.4).toFixed(2))
-    : minRiskRewardBase
+  const reboundAligned = !!(rebound && rebound.active && signal?.direction && rebound.direction === signal.direction)
+  const minConfidence = reboundAligned ? Math.max(40, minConfidenceBase - 10) : minConfidenceBase
+  const minRiskReward = reboundAligned ? Math.max(1.2, +(minRiskRewardBase - 0.4).toFixed(2)) : minRiskRewardBase
   if (reboundAligned) {
     reasons.push(`Rebound context aligned (strength ${rebound.strength}) — thresholds relaxed`)
   }
@@ -305,12 +302,13 @@ function evaluateSignal({ signal, factors = {}, position = null, accountState = 
     const shouldExpandTp = horizon === 'scalp' || reboundAligned
     const minCostTpBps = shouldExpandTp ? roundTripCostBps * edgeMultiple + 0.1 : 0
     const recentRangeBps = Number(factors.recentRangeBps)
-    const recentRangeTpBps = shouldExpandTp && Number.isFinite(recentRangeBps)
-      ? Math.min(30, Math.max(0, recentRangeBps * (reboundAligned ? 0.35 : 0.25)))
-      : 0
+    const recentRangeTpBps =
+      shouldExpandTp && Number.isFinite(recentRangeBps)
+        ? Math.min(30, Math.max(0, recentRangeBps * (reboundAligned ? 0.35 : 0.25)))
+        : 0
     const minDynamicTpBps = Math.max(minCostTpBps, recentRangeTpBps)
     const stopDist = atr * stopAtrMult
-    const tpDist = Math.max(atr * tpAtrMult, price * minDynamicTpBps / 10_000)
+    const tpDist = Math.max(atr * tpAtrMult, (price * minDynamicTpBps) / 10_000)
     const stopLoss = signal.direction === 'long' ? price - stopDist : price + stopDist
     const takeProfit = signal.direction === 'long' ? price + tpDist : price - tpDist
     adjustedRisk = {
@@ -399,9 +397,7 @@ function evaluateSignal({ signal, factors = {}, position = null, accountState = 
   // manual confirmation. In semi mode we fall back to a MANUAL popup so a
   // human can sanity-check the entry.
   if (executionMode === 'auto' && adjustedRisk) {
-    reasons.unshift(
-      `Auto-mode override — bot executes soft-fail signal (conf ${confidence}% / R/R ${rr.toFixed(2)})`,
-    )
+    reasons.unshift(`Auto-mode override — bot executes soft-fail signal (conf ${confidence}% / R/R ${rr.toFixed(2)})`)
     return {
       mode: SIGNAL_MODE.AUTO,
       approved: true,
@@ -443,7 +439,17 @@ function evaluateSignal({ signal, factors = {}, position = null, accountState = 
  *   closeReason?: string,
  * }}
  */
-function evaluateActivePosition({ position, factors = {}, signalState = null, markPrice = null, now = Date.now(), config = {} } = {}) {
+function evaluateActivePosition({
+  position,
+  factors = {},
+  signalState = null,
+  markPrice = null,
+  now = Date.now(),
+  config = {},
+  netScore = null,
+  signalIssuedAt = null,
+  consecutiveExitTicks = 0,
+} = {}) {
   if (!position || position.status !== 'OPEN') return { action: POSITION_ACTION.HOLD }
   const dir = String(position.direction).toUpperCase()
   const price = Number(markPrice ?? position.currentPrice ?? factors.price)
@@ -452,17 +458,61 @@ function evaluateActivePosition({ position, factors = {}, signalState = null, ma
   const sl = Number(position.stopLoss)
   const atr = Number(factors.atr)
 
-  // 1. State-machine asks for exit → close.
-  if (signalState && (
-    (dir === 'LONG' && signalState === 'LONG_EXIT_SIGNAL') ||
-    (dir === 'SHORT' && signalState === 'SHORT_EXIT_SIGNAL') ||
-    signalState === 'INVALIDATED'
-  )) {
+  // 1. INVALIDATED → close immediately.
+  if (signalState === 'INVALIDATED') {
     return {
       action: POSITION_ACTION.CLOSE,
-      closeReason: signalState === 'INVALIDATED' ? 'SIGNAL_INVALIDATED' : 'SIGNAL_EXIT',
-      reason: `state-machine reached ${signalState}`,
+      closeReason: 'SIGNAL_INVALIDATED',
+      reason: 'state-machine reached INVALIDATED',
     }
+  }
+
+  // 1b. EXIT_SIGNAL → close only when at least one condition is met:
+  //   (a) trade is at a loss
+  //   (b) signal has been live ≥ exitGuardMs (multi-tick by time)
+  //   (c) opposing netScore exceeds strong threshold
+  //   (d) signal age ≥ exitMultiTickMs (configurable tick confirmation)
+  const isExitSignal =
+    (dir === 'LONG' && signalState === 'LONG_EXIT_SIGNAL') || (dir === 'SHORT' && signalState === 'SHORT_EXIT_SIGNAL')
+
+  if (isExitSignal) {
+    // Consecutive-tick gate: require ≥ exitConfirmTicks engine cycles in EXIT_SIGNAL
+    // before evaluating any close condition. Default 2 (≈4 s at 2 s cadence).
+    const minExitTicks = Number(config?.exitConfirmTicks ?? 2)
+
+    if (consecutiveExitTicks >= minExitTicks) {
+      const atLoss =
+        Number.isFinite(price) && Number.isFinite(entry) && (dir === 'LONG' ? price <= entry : price >= entry)
+
+      const signalAge = signalIssuedAt != null && Number.isFinite(signalIssuedAt) ? now - signalIssuedAt : 0
+
+      const exitGuardMs = Number(config?.exitGuardMs ?? 0)
+      const timeExpired = exitGuardMs > 0 && signalAge >= exitGuardMs
+
+      const exitMultiTickMs = Number(config?.exitMultiTickMs ?? 0)
+      const multiTick = exitMultiTickMs > 0 && signalAge >= exitMultiTickMs
+
+      const strongThreshold = Number(config?.exitOpposingScoreThreshold ?? 0.55)
+      const opposingScore =
+        netScore != null &&
+        ((dir === 'LONG' && netScore < -strongThreshold) || (dir === 'SHORT' && netScore > strongThreshold))
+
+      if (atLoss || timeExpired || opposingScore || multiTick) {
+        const trigger = atLoss
+          ? 'at-loss'
+          : timeExpired
+            ? 'time-guard'
+            : opposingScore
+              ? 'opposing-score'
+              : 'multi-tick'
+        return {
+          action: POSITION_ACTION.CLOSE,
+          closeReason: 'SIGNAL_EXIT',
+          reason: `EXIT_SIGNAL confirmed (${trigger}, ${consecutiveExitTicks} ticks)`,
+        }
+      }
+    }
+    // Tick threshold not yet reached or no condition met — observe without closing.
   }
 
   // 1b. Time-stop — for micro-operations (30s–1m): if the position has been
@@ -470,10 +520,16 @@ function evaluateActivePosition({ position, factors = {}, signalState = null, ma
   //     TP distance, close it. Disabled by default (timeStopMs = 0) for
   //     backward compatibility; the adapter opts in by passing config.
   const timeStopMs = Number(config?.timeStopMs ?? 0)
-  const minTpProgress = Number(config?.minTpProgress ?? 0.30)
+  const minTpProgress = Number(config?.minTpProgress ?? 0.3)
   const openedAt = Number(position.openedAt)
-  if (timeStopMs > 0 && Number.isFinite(openedAt) && (now - openedAt) >= timeStopMs &&
-      Number.isFinite(entry) && Number.isFinite(tp) && Number.isFinite(price)) {
+  if (
+    timeStopMs > 0 &&
+    Number.isFinite(openedAt) &&
+    now - openedAt >= timeStopMs &&
+    Number.isFinite(entry) &&
+    Number.isFinite(tp) &&
+    Number.isFinite(price)
+  ) {
     const tpDist = Math.abs(tp - entry)
     if (tpDist > 0) {
       const progress = dir === 'LONG' ? (price - entry) / tpDist : (entry - price) / tpDist
@@ -488,28 +544,39 @@ function evaluateActivePosition({ position, factors = {}, signalState = null, ma
   }
 
   // 2. Spoofing on the adverse side → tighten SL to entry (break-even).
-  const adverseSpoof =
-    (dir === 'LONG' && factors.recentSpoofingAsk) ||
-    (dir === 'SHORT' && factors.recentSpoofingBid)
-  if (adverseSpoof && Number.isFinite(entry) && Number.isFinite(sl)) {
-    const beSL = entry
-    const improves = dir === 'LONG' ? beSL > sl : beSL < sl
-    if (improves) {
-      return {
-        action: POSITION_ACTION.ADJUST_SL,
-        newStopLoss: +beSL.toFixed(6),
-        reason: 'adverse-side spoofing detected — move SL to break-even',
+  //     Guard: require at least 0.5×ATR of profit before locking break-even;
+  //     without this, a position opened at a 1×ATR stop gets pinned immediately.
+  const adverseSpoof = (dir === 'LONG' && factors.recentSpoofingAsk) || (dir === 'SHORT' && factors.recentSpoofingBid)
+  if (adverseSpoof && Number.isFinite(entry) && Number.isFinite(sl) && Number.isFinite(price)) {
+    const minBeProfit = Number.isFinite(atr) && atr > 0 ? atr * 0.5 : entry * 0.0005
+    const meaningfulProfit = dir === 'LONG' ? price >= entry + minBeProfit : price <= entry - minBeProfit
+    if (meaningfulProfit) {
+      const beSL = entry
+      const improves = dir === 'LONG' ? beSL > sl : beSL < sl
+      if (improves) {
+        return {
+          action: POSITION_ACTION.ADJUST_SL,
+          newStopLoss: +beSL.toFixed(6),
+          reason: 'adverse-side spoofing detected — move SL to break-even',
+          stopLossOrigin: 'BREAK_EVEN',
+        }
       }
     }
   }
 
   // 3. Exit warning while in profit → break-even SL.
-  if (signalState && (
-    (dir === 'LONG' && signalState === 'LONG_EXIT_WARNING') ||
-    (dir === 'SHORT' && signalState === 'SHORT_EXIT_WARNING')
-  ) && Number.isFinite(entry) && Number.isFinite(price)) {
-    const inProfit = dir === 'LONG' ? price > entry : price < entry
-    if (inProfit && Number.isFinite(sl)) {
+  //     Guard: require at least 0.5×ATR of profit so a single-tick exit
+  //     warning cannot immediately pin the SL to entry price.
+  if (
+    signalState &&
+    ((dir === 'LONG' && signalState === 'LONG_EXIT_WARNING') ||
+      (dir === 'SHORT' && signalState === 'SHORT_EXIT_WARNING')) &&
+    Number.isFinite(entry) &&
+    Number.isFinite(price)
+  ) {
+    const minBeProfit = Number.isFinite(atr) && atr > 0 ? atr * 0.5 : entry * 0.0005
+    const meaningfulProfit = dir === 'LONG' ? price >= entry + minBeProfit : price <= entry - minBeProfit
+    if (meaningfulProfit && Number.isFinite(sl)) {
       const beSL = entry
       const improves = dir === 'LONG' ? beSL > sl : beSL < sl
       if (improves) {
@@ -517,6 +584,7 @@ function evaluateActivePosition({ position, factors = {}, signalState = null, ma
           action: POSITION_ACTION.ADJUST_SL,
           newStopLoss: +beSL.toFixed(6),
           reason: 'exit-warning while in profit — lock break-even',
+          stopLossOrigin: 'BREAK_EVEN',
         }
       }
     }
@@ -528,8 +596,8 @@ function evaluateActivePosition({ position, factors = {}, signalState = null, ma
     const tpDist = Math.abs(tp - entry)
     if (tpDist > 0) {
       const progress = dir === 'LONG' ? (price - entry) / tpDist : (entry - price) / tpDist
-      if (progress >= 0.60) {
-        const lockDist = tpDist * 0.30
+      if (progress >= 0.6) {
+        const lockDist = tpDist * 0.3
         const newSL = dir === 'LONG' ? entry + lockDist : entry - lockDist
         const improves = !Number.isFinite(sl) || (dir === 'LONG' ? newSL > sl : newSL < sl)
         if (improves) {
@@ -537,6 +605,7 @@ function evaluateActivePosition({ position, factors = {}, signalState = null, ma
             action: POSITION_ACTION.ADJUST_SL,
             newStopLoss: +newSL.toFixed(6),
             reason: `trailing-SL — ${Math.round(progress * 100)}% of TP reached, lock 30%`,
+            stopLossOrigin: 'TRAILING',
           }
         }
       }
@@ -554,6 +623,7 @@ function evaluateActivePosition({ position, factors = {}, signalState = null, ma
           action: POSITION_ACTION.ADJUST_SL,
           newStopLoss: +trailSL.toFixed(6),
           reason: 'ATR trailing — drag SL by 1×ATR behind price',
+          stopLossOrigin: 'TRAILING',
         }
       }
     }
@@ -595,7 +665,8 @@ function summarizeActiveRules({ factors = {}, position = null } = {}) {
     rules.push('Break-even SL ante spoofing adverso')
     rules.push('Trailing 30% al alcanzar 60% del TP')
     rules.push('Trailing 1×ATR cuando precio favorece ≥1×ATR')
-    rules.push('Cierre automático en EXIT_SIGNAL / INVALIDATED')
+    rules.push('Cierre inmediato en INVALIDATED')
+    rules.push('Cierre condicional en EXIT_SIGNAL (pérdida, tiempo, score opuesto o multi-tick)')
   }
 
   return rules

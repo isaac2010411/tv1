@@ -100,12 +100,15 @@ class PaperTradeService {
    * moves done by the RiskManager). Returns the new snapshot or null when
    * the position is unknown or already closed.
    */
-  updateStops({ symbol, positionId, stopLoss, takeProfit }) {
+  updateStops({ symbol, positionId, stopLoss, takeProfit, stopLossOrigin }) {
     const normalizedSymbol = (symbol ?? '').trim().toUpperCase()
     const symbolMap = this._openBySymbol.get(normalizedSymbol)
     if (!symbolMap || !positionId || !symbolMap.has(positionId)) return null
     const pos = symbolMap.get(positionId)
-    if (stopLoss !== undefined && isFiniteNumber(stopLoss)) pos.stopLoss = Number(stopLoss)
+    if (stopLoss !== undefined && isFiniteNumber(stopLoss)) {
+      pos.stopLoss = Number(stopLoss)
+      if (stopLossOrigin != null) pos.stopLossOrigin = stopLossOrigin
+    }
     if (takeProfit !== undefined && isFiniteNumber(takeProfit)) pos.takeProfit = Number(takeProfit)
     return { ...pos }
   }
@@ -127,7 +130,8 @@ class PaperTradeService {
         total += Number(pos.unrealizedPnl ?? 0)
       }
     }
-    const startOfDay = new Date(); startOfDay.setUTCHours(0, 0, 0, 0)
+    const startOfDay = new Date()
+    startOfDay.setUTCHours(0, 0, 0, 0)
     const startMs = startOfDay.getTime()
     for (const list of this._closedBySymbol.values()) {
       for (const pos of list) {
@@ -184,7 +188,7 @@ class PaperTradeService {
     })
   }
 
-  onPriceTick({ symbol, price, now = Date.now() }) {
+  onPriceTick({ symbol, price, now = Date.now(), skipAutoClose = false }) {
     const normalizedSymbol = (symbol ?? '').trim().toUpperCase()
     if (!normalizedSymbol || !isFiniteNumber(price)) return []
     const symbolMap = this._openBySymbol.get(normalizedSymbol)
@@ -216,7 +220,21 @@ class PaperTradeService {
 
       if (!shouldStop && !shouldTakeProfit) continue
 
-      const closeReason = shouldTakeProfit ? 'TAKE_PROFIT' : 'STOP_LOSS'
+      let closeReason = 'TAKE_PROFIT'
+      if (!shouldTakeProfit) {
+        if (position.stopLossOrigin === 'TRAILING') closeReason = 'TRAILING_STOP'
+        else if (position.stopLossOrigin === 'BREAK_EVEN') closeReason = 'BREAK_EVEN_EXIT'
+        else closeReason = 'STOP_LOSS'
+      }
+
+      // When skipAutoClose is true the caller handles the actual close
+      // (e.g. to simulate fill latency). Return a PENDING_CLOSE event with
+      // the snapshot and the resolved reason so the caller can act on it.
+      if (skipAutoClose) {
+        output.push({ type: 'PENDING_CLOSE', position: { ...position }, closeReason })
+        continue
+      }
+
       const closed = this.closePosition({
         symbol: normalizedSymbol,
         positionId: position.id,

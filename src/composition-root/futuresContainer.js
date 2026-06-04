@@ -14,6 +14,7 @@ const {
 } = require('../infrastructure/adapters/outbound/binance/BinanceFuturesRealtimeAdapter')
 
 const { GetFuturesAssetContext } = require('../application/futures/use-cases/GetFuturesAssetContext')
+const { AssetContextManager } = require('../application/futures/context/AssetContextManager')
 const { ValidateFuturesOrder } = require('../application/futures/use-cases/ValidateFuturesOrder')
 const { SubscribeFuturesAsset } = require('../application/futures/use-cases/SubscribeFuturesAsset')
 const { UnsubscribeFuturesAsset } = require('../application/futures/use-cases/UnsubscribeFuturesAsset')
@@ -87,7 +88,14 @@ const buildFuturesContainer = ({ binanceClient, io, tradingPersistence = null, s
   })
 
   // ── Application use cases ─────────────────────────────────────────────────
-  const getAssetContextUseCase = new GetFuturesAssetContext({ tradingRulesPort, marketDataPort, accountPort })
+  const assetContextManager = new AssetContextManager({
+    tradingRulesPort,
+    marketDataPort,
+    accountPort,
+    riskManager,
+    portfolioManager,
+  })
+  const getAssetContextUseCase = new GetFuturesAssetContext({ assetContextManager })
   const validateOrderUseCase = new ValidateFuturesOrder({ tradingRulesPort, riskGuard: riskManager })
   const subscribeFuturesAssetUseCase = new SubscribeFuturesAsset({ realtimePort, marketDataPort })
   const unsubscribeFuturesAssetUseCase = new UnsubscribeFuturesAsset({ realtimePort })
@@ -95,6 +103,7 @@ const buildFuturesContainer = ({ binanceClient, io, tradingPersistence = null, s
   // ── Inbound adapters ──────────────────────────────────────────────────────
   const socketAdapter = new FuturesAssetSocketAdapter({
     io,
+    assetContextManager,
     getAssetContextUseCase,
     subscribeFuturesAssetUseCase,
     unsubscribeFuturesAssetUseCase,

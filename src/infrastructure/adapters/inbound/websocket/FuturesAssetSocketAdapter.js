@@ -3,6 +3,7 @@
 const { performance } = require('perf_hooks')
 const { logger } = require('../../../../shared/utils/logger')
 const { FUTURES_SOCKET_EVENTS, FUTURES_SOCKET_COMMANDS } = require('../../../../shared/contracts/futuresSocketEvents')
+const { assertAssetContext } = require('../../../../shared/contracts/AssetContextContract')
 const { OrderBook } = require('../../../../domain/futures/entities/OrderBook')
 const { SpoofingDetectorService } = require('../../../../domain/futures/services/SpoofingDetectorService')
 const { LiquidityShiftService } = require('../../../../domain/futures/services/LiquidityShiftService')
@@ -39,6 +40,8 @@ const MAX_CVD_HISTORY = 200
 const MAX_SPOOF_CANDIDATES = 100
 /** Minimum ms between signal engine runs (throttle). */
 const SIGNAL_ENGINE_THROTTLE_MS = 2_000
+/** Simulated fill latency for paper trades (open & close). 0 = immediate. */
+const PAPER_FILL_DELAY_MS = Number(process.env.PAPER_FILL_DELAY_MS ?? 2_000)
 const LATENCY_DEBUG = process.env.LATENCY_DEBUG === '1'
 const LATENCY_WARN_MS = Number(process.env.LATENCY_WARN_MS ?? 8)
 const DEPTH_QUEUE_MAX = Number(process.env.DEPTH_QUEUE_MAX ?? 400)
@@ -48,15 +51,19 @@ const DEPTH_COALESCE_THRESHOLD = Number(process.env.DEPTH_COALESCE_THRESHOLD ?? 
 const DEPTH_COALESCE_WINDOW = Number(process.env.DEPTH_COALESCE_WINDOW ?? 20)
 const DEPTH_MAX_AGE_MS = Number(process.env.DEPTH_MAX_AGE_MS ?? 300)
 const DEPTH_DROP_CHUNK_PCT = Number(process.env.DEPTH_DROP_CHUNK_PCT ?? 0.25)
-const DEPTH_BACKPRESSURE_SKIP_SERVICES_THRESHOLD = Number(
-  process.env.DEPTH_BACKPRESSURE_SKIP_SERVICES_THRESHOLD ?? 180,
-)
+const DEPTH_BACKPRESSURE_SKIP_SERVICES_THRESHOLD = Number(process.env.DEPTH_BACKPRESSURE_SKIP_SERVICES_THRESHOLD ?? 180)
 const TRADE_OUT_OF_ORDER_TOLERANCE_MS = Number(process.env.TRADE_OUT_OF_ORDER_TOLERANCE_MS ?? 150)
 const SESSION_ID = process.env.TRADING_SESSION_ID ?? 'default'
 // Phase 2.B — Opt-in coalescer for high-frequency events. Disabled by default
 // to keep wire-format BC; enable with EMIT_BATCH_MODE=true.
 const EMIT_BATCH_MODE = process.env.EMIT_BATCH_MODE === 'true'
 const EMIT_BATCH_WINDOW_MS = Number(process.env.EMIT_BATCH_WINDOW_MS ?? 50)
+const ASSET_CONTEXT_REFRESH_EVENT_REASON = Object.freeze({
+  [FUTURES_SOCKET_EVENTS.SIGNAL_UPDATE]: 'SIGNAL_UPDATE',
+  [FUTURES_SOCKET_EVENTS.PAPER_TRADE_OPENED]: 'POSITION_UPDATE',
+  [FUTURES_SOCKET_EVENTS.PAPER_TRADE_UPDATED]: 'POSITION_UPDATE',
+  [FUTURES_SOCKET_EVENTS.PAPER_TRADE_CLOSED]: 'POSITION_UPDATE',
+})
 
 function intervalToMs(interval) {
   const m = /^(\d+)([smhdw])$/.exec(interval ?? '')
@@ -124,6 +131,7 @@ function withRealtimeMeta(
 class FuturesAssetSocketAdapter {
   constructor({
     io,
+    assetContextManager = null,
     getAssetContextUseCase,
     subscribeFuturesAssetUseCase,
     unsubscribeFuturesAssetUseCase,
@@ -134,6 +142,7 @@ class FuturesAssetSocketAdapter {
     scalpConfig = null,
   }) {
     this.io = io
+    this.assetContextManager = assetContextManager
     this.getAssetContextUseCase = getAssetContextUseCase
     this.subscribeFuturesAssetUseCase = subscribeFuturesAssetUseCase
     this.unsubscribeFuturesAssetUseCase = unsubscribeFuturesAssetUseCase
@@ -144,6 +153,8 @@ class FuturesAssetSocketAdapter {
     this.tradingPersistence = tradingPersistence
     this.riskManager = riskManager
     this.portfolioManager = portfolioManager
+    this._assetContextRefreshTimers = new Map()
+    this._assetContextRefreshInFlight = new Set()
     this.orderBookMetrics = new OrderBookMetrics()
     this.decisionTapeService = new DecisionTapeService()
     // Scalp / micro-operation runtime config. May be null when running with
@@ -153,9 +164,9 @@ class FuturesAssetSocketAdapter {
     if (scalpConfig?.horizon === 'scalp') {
       logger.info(
         `[SocketAdapter] Scalp horizon ENABLED — equity=$${scalpConfig.account.equity} ` +
-        `risk/trade=${(scalpConfig.account.riskPerTradePct * 100).toFixed(2)}% ` +
-        `costs=${scalpConfig.costs.feeBps}+${scalpConfig.costs.slippageBps}bps ` +
-        `timeStop=${scalpConfig.position.timeStopMs}ms`,
+          `risk/trade=${(scalpConfig.account.riskPerTradePct * 100).toFixed(2)}% ` +
+          `costs=${scalpConfig.costs.feeBps}+${scalpConfig.costs.slippageBps}bps ` +
+          `timeStop=${scalpConfig.position.timeStopMs}ms`,
       )
     }
 
@@ -183,6 +194,11 @@ class FuturesAssetSocketAdapter {
       this._coalescer.dispose()
       this._coalescer = null
     }
+    for (const timer of this._assetContextRefreshTimers.values()) {
+      clearTimeout(timer)
+    }
+    this._assetContextRefreshTimers.clear()
+    this._assetContextRefreshInFlight.clear()
   }
 
   register(socket) {
@@ -212,6 +228,11 @@ class FuturesAssetSocketAdapter {
     if (LATENCY_DEBUG && ms >= LATENCY_WARN_MS) {
       logger.warn(`[SocketAdapter] Slow room emit ${eventName} ${room}: ${ms.toFixed(2)}ms`)
     }
+
+    const refreshReason = ASSET_CONTEXT_REFRESH_EVENT_REASON[eventName]
+    if (refreshReason && symbol !== 'unknown') {
+      this._scheduleAssetContextRefresh(symbol, refreshReason)
+    }
   }
 
   _emitToSocket(socket, eventName, payload, meta = {}) {
@@ -225,11 +246,13 @@ class FuturesAssetSocketAdapter {
   emitRiskDecision(payload) {
     if (!payload) return
     this.io.emit(FUTURES_SOCKET_EVENTS.RISK_DECISION, payload)
+    this._scheduleAssetContextRefresh(payload.symbol, 'RISK_UPDATE')
   }
 
   emitOrderLifecycle(order) {
     if (!order) return
     this.io.emit(FUTURES_SOCKET_EVENTS.ORDER_LIFECYCLE, order)
+    this._scheduleAssetContextRefresh(order.symbol, 'ORDER_UPDATE')
   }
 
   emitPortfolioSnapshot(snapshot) {
@@ -244,6 +267,85 @@ class FuturesAssetSocketAdapter {
     const next = current + 1
     bundle._streamSequences.set(stream, next)
     return next
+  }
+
+  async _buildAssetContext(symbol) {
+    if (this.assetContextManager?.build) {
+      return this.assetContextManager.build(symbol)
+    }
+    return this.getAssetContextUseCase.execute({ symbol })
+  }
+
+  async _emitAssetContextToSocket(socket, symbol, reason) {
+    const t0 = performance.now()
+    const context = assertAssetContext(await this._buildAssetContext(symbol), { channel: 'socket.bootstrap' })
+    const buildMs = performance.now() - t0
+    const size = Buffer.byteLength(JSON.stringify(context), 'utf8')
+
+    metrics.assetContextBuildTimeMs.observe({ symbol, reason }, buildMs)
+    metrics.assetContextEmitCount.inc({ symbol, target: 'socket', reason })
+    metrics.assetContextEmitSize.observe({ symbol, target: 'socket', reason }, size)
+
+    logger.info(`[ASSET_CONTEXT_BUILD] symbol=${symbol} reason=${reason} durationMs=${buildMs.toFixed(2)}`)
+
+    this._emitToSocket(socket, FUTURES_SOCKET_EVENTS.ASSET_CONTEXT, context, {
+      stream: 'asset.context',
+      symbol,
+      reason,
+    })
+
+    logger.info(`[ASSET_CONTEXT_EMITTED] symbol=${symbol} reason=${reason} target=socket bytes=${size}`)
+
+    return context
+  }
+
+  _scheduleAssetContextRefresh(symbol, reason) {
+    if (!symbol || typeof symbol !== 'string') return
+    const normalizedSymbol = symbol.trim().toUpperCase()
+    const room = `futures:${normalizedSymbol}`
+    if ((this._roomRefs.get(normalizedSymbol) ?? 0) <= 0) return
+    if (this._assetContextRefreshInFlight.has(normalizedSymbol)) return
+    if (this._assetContextRefreshTimers.has(normalizedSymbol)) return
+
+    const timer = setTimeout(async () => {
+      this._assetContextRefreshTimers.delete(normalizedSymbol)
+      if (this._assetContextRefreshInFlight.has(normalizedSymbol)) return
+      this._assetContextRefreshInFlight.add(normalizedSymbol)
+      try {
+        const t0 = performance.now()
+        const context = assertAssetContext(await this._buildAssetContext(normalizedSymbol), {
+          channel: 'socket.refresh',
+        })
+        const buildMs = performance.now() - t0
+        const size = Buffer.byteLength(JSON.stringify(context), 'utf8')
+        const refreshReason = String(reason || 'CONTEXT_REFRESH')
+
+        metrics.assetContextBuildTimeMs.observe({ symbol: normalizedSymbol, reason: refreshReason }, buildMs)
+        metrics.assetContextEmitCount.inc({ symbol: normalizedSymbol, target: 'room', reason: refreshReason })
+        metrics.assetContextEmitSize.observe({ symbol: normalizedSymbol, target: 'room', reason: refreshReason }, size)
+
+        logger.info(
+          `[ASSET_CONTEXT_BUILD] symbol=${normalizedSymbol} reason=${refreshReason} durationMs=${buildMs.toFixed(2)}`,
+        )
+
+        this._emitToRoom(room, FUTURES_SOCKET_EVENTS.ASSET_CONTEXT, context, {
+          stream: 'asset.context',
+          symbol: normalizedSymbol,
+          reason: refreshReason,
+        })
+
+        logger.info(
+          `[ASSET_CONTEXT_EMITTED] symbol=${normalizedSymbol} reason=${refreshReason} target=room bytes=${size}`,
+        )
+      } catch (err) {
+        logger.warn(`[SocketAdapter] asset context refresh failed for ${normalizedSymbol}: ${err.message}`)
+      } finally {
+        this._assetContextRefreshInFlight.delete(normalizedSymbol)
+      }
+    }, 120)
+
+    if (timer.unref) timer.unref()
+    this._assetContextRefreshTimers.set(normalizedSymbol, timer)
   }
 
   _withStreamSequenceMeta(meta = {}) {
@@ -308,8 +410,8 @@ class FuturesAssetSocketAdapter {
                 tradeOutOfOrderDropped: bundle._droppedOutOfOrderTrades,
               },
               {
-              stream: 'book.health',
-              symbol,
+                stream: 'book.health',
+                symbol,
               },
             )
           } catch (err) {
@@ -380,9 +482,7 @@ class FuturesAssetSocketAdapter {
         // extend the entry signal expiry floor so the popup doesn't expire
         // before they can react.
         minEntryExpiryMs:
-          (this.scalpConfig?.executionMode === 'semi'
-            ? Number(this.scalpConfig?.manualReviewExpiryMs ?? 0)
-            : 0) || 0,
+          (this.scalpConfig?.executionMode === 'semi' ? Number(this.scalpConfig?.manualReviewExpiryMs ?? 0) : 0) || 0,
       }),
       _recentCvdHistory: new RingBuffer(MAX_CVD_HISTORY),
       _recentSpoofingCandidates: new RingBuffer(MAX_SPOOF_CANDIDATES),
@@ -406,7 +506,11 @@ class FuturesAssetSocketAdapter {
       _droppedOutOfOrderTrades: 0,
       _lastOrderBook: null,
       _lastBookMetrics: null,
+      _exitSignalTicks: 0,
       _signalEngineTimer: null,
+      // Positions scheduled for a delayed auto-close (fill latency simulation).
+      // Guards against the same position being queued twice on consecutive ticks.
+      _pendingAutoCloseIds: new Set(),
     })
 
     metrics.activeSymbols.set({}, this._symbolServices.size)
@@ -442,10 +546,18 @@ class FuturesAssetSocketAdapter {
     bundle._droppedOutOfOrderTrades = 0
     bundle._lastOrderBook = null
     bundle._lastBookMetrics = null
+    bundle._exitSignalTicks = 0
+    bundle._pendingAutoCloseIds.clear()
     bundle._lastBookLocalEmitAt = null
     bundle._lastBookMetricsEmitAt = null
     bundle._lastDecisionTapeEmitAt = null
     this._symbolServices.delete(symbol)
+    const refreshTimer = this._assetContextRefreshTimers.get(symbol)
+    if (refreshTimer) {
+      clearTimeout(refreshTimer)
+      this._assetContextRefreshTimers.delete(symbol)
+    }
+    this._assetContextRefreshInFlight.delete(symbol)
     // Drop closed-position history for this symbol (open positions are kept so
     // that an unsubscribe + resubscribe within a session doesn't lose state).
     if (this.paperTradeService?.clearSymbolHistory) {
@@ -672,11 +784,7 @@ class FuturesAssetSocketAdapter {
       await this._decrementRef(previousSymbol)
     }
     try {
-      const context = await this.getAssetContextUseCase.execute({ symbol: normalizedSymbol })
-      this._emitToSocket(socket, FUTURES_SOCKET_EVENTS.ASSET_CONTEXT, context, {
-        stream: 'asset.context',
-        symbol: normalizedSymbol,
-      })
+      const context = await this._emitAssetContextToSocket(socket, normalizedSymbol, 'SUBSCRIBE_SYMBOL')
       socket.join(room)
       const refCount = (this._roomRefs.get(normalizedSymbol) ?? 0) + 1
       this._roomRefs.set(normalizedSymbol, refCount)
@@ -973,8 +1081,7 @@ class FuturesAssetSocketAdapter {
             // cumulative realized PnL across restarts) so position sizing
             // shrinks after losses and grows after wins. Falls back to the
             // static config value if the PortfolioManager isn't wired.
-            accountState.equity =
-              this.portfolioManager?.getPaperEquity?.() ?? this.scalpConfig.account.equity
+            accountState.equity = this.portfolioManager?.getPaperEquity?.() ?? this.scalpConfig.account.equity
             accountState.riskPerTradePct = this.scalpConfig.account.riskPerTradePct
             if (Number.isFinite(this.scalpConfig.account.maxNotional)) {
               accountState.maxNotional = this.scalpConfig.account.maxNotional
@@ -984,7 +1091,7 @@ class FuturesAssetSocketAdapter {
           if (this.scalpConfig?.costs) {
             accountState.costs = this.scalpConfig.costs
           }
-             const decision = this.riskManager.evaluateSignal({
+          const decision = this.riskManager.evaluateSignal({
             signal: incoming,
             factors: result.factors,
             position: null,
@@ -1000,14 +1107,12 @@ class FuturesAssetSocketAdapter {
             minRiskReward: decision.minRiskReward,
             rule: decision.rule,
             adjustedRisk: decision.adjustedRisk,
-            executionMode: decision.executionMode ?? (this.scalpConfig?.executionMode ?? 'auto'),
+            executionMode: decision.executionMode ?? this.scalpConfig?.executionMode ?? 'auto',
             activeRules,
           }
 
           if (decision.approved === false) {
-            logger.info(
-              `[SocketAdapter] [RISK-AUTO] rejected ${symbol}: ${(decision.reasons ?? []).join('; ')}`,
-            )
+            logger.info(`[SocketAdapter] [RISK-AUTO] rejected ${symbol}: ${(decision.reasons ?? []).join('; ')}`)
           }
 
           if (decision.approved && decision.mode === 'AUTO') {
@@ -1019,11 +1124,21 @@ class FuturesAssetSocketAdapter {
       }
       if (this.riskManager && currentOpenPosition?.autoManaged) {
         try {
+          // Track consecutive ticks where this position is in EXIT_SIGNAL state.
+          const _posDir = String(currentOpenPosition.direction ?? '').toUpperCase()
+          const _inExitSignal =
+            (_posDir === 'LONG' && result.state === 'LONG_EXIT_SIGNAL') ||
+            (_posDir === 'SHORT' && result.state === 'SHORT_EXIT_SIGNAL')
+          bundle._exitSignalTicks = _inExitSignal ? (bundle._exitSignalTicks ?? 0) + 1 : 0
+
           const action = this.riskManager.evaluateActivePosition({
             position: currentOpenPosition,
             factors: result.factors,
             signalState: result.state,
             markPrice: bundle._lastMarkPrice,
+            netScore: result.netScore,
+            signalIssuedAt: result.activeSignal?.createdAt ?? null,
+            consecutiveExitTicks: bundle._exitSignalTicks,
             config: this.scalpConfig?.position ?? undefined,
           })
           // Surface the autonomous management decision to the UI so the popup
@@ -1079,23 +1194,27 @@ class FuturesAssetSocketAdapter {
           backendProcessedAt,
         })
 
+        this._scheduleAssetContextRefresh(symbol, 'SIGNAL_UPDATE')
+
         this._persistSignalHistory({
           ...signalPayload,
           interval: bundle.signalEngine.interval,
           signalRisk: signalPayload.activeSignal?.risk ?? signalPayload.signal?.risk ?? null,
           adjustedRisk: autoExecution?.adjustedRisk ?? null,
           factorsSummary: compactSignalFactors(result.factors),
-          reasons: autoExecution?.approved === false
-            ? [
-                ...(Array.isArray(signalPayload.reasons) ? signalPayload.reasons : []),
-                ...(Array.isArray(autoExecution.reasons) ? autoExecution.reasons : []),
-              ]
-            : signalPayload.reasons,
-          decision: autoExecution?.approved === false
-            ? 'AUTO_REJECTED'
-            : autoExecution?.mode === 'AUTO'
-              ? 'AUTO_ACCEPTED'
-              : 'SIGNAL_UPDATE',
+          reasons:
+            autoExecution?.approved === false
+              ? [
+                  ...(Array.isArray(signalPayload.reasons) ? signalPayload.reasons : []),
+                  ...(Array.isArray(autoExecution.reasons) ? autoExecution.reasons : []),
+                ]
+              : signalPayload.reasons,
+          decision:
+            autoExecution?.approved === false
+              ? 'AUTO_REJECTED'
+              : autoExecution?.mode === 'AUTO'
+                ? 'AUTO_ACCEPTED'
+                : 'SIGNAL_UPDATE',
           activeSignalId: signalPayload.activeSignal?.id ?? null,
         })
       }
@@ -1121,70 +1240,97 @@ class FuturesAssetSocketAdapter {
     const direction = String(signal.direction || '').toUpperCase()
     if (direction !== 'LONG' && direction !== 'SHORT') return
     const risk = decision.adjustedRisk ?? signal.risk ?? {}
-    const entryPrice = Number(risk.entryPrice ?? bundle._lastMarkPrice)
-    if (!Number.isFinite(entryPrice)) return
-    try {
-      const opened = this.paperTradeService.openPosition({
-        symbol,
-        userId: 'risk-manager',
-        direction,
-        entryPrice,
-        quantity: risk.recommendedQuantity ?? risk.quantity ?? signal.quantity ?? null,
-        stopLoss: risk.stopLoss ?? null,
-        takeProfit: risk.takeProfit ?? null,
-        sourceSignalId: signal.id,
-        autoManaged: true,
-        autoExecutionMeta: {
-          mode: decision.mode,
-          regime: decision.regime,
-          rule: decision.rule,
-          minConfidence: decision.minConfidence,
-          minRiskReward: decision.minRiskReward,
-          reasons: decision.reasons,
-        },
-      })
-      this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_OPENED, opened, {
-        stream: 'paperTrade.opened',
-        symbol,
-      })
-      this._emitPaperPortfolioSnapshot()
-      this._persistPaperPosition(opened)
-      this._persistSignalHistory({
-        timestamp: Date.now(),
-        symbol,
-        interval: bundle.signalEngine.interval,
-        state: bundle.signalEngine.getState(),
-        prevState: bundle.signalEngine.getState(),
-        netScore: signal.score ?? 0,
-        confidence: signal.confidence ?? 0,
-        reasons: decision.reasons ?? [],
-        missingContext: [],
-        decision: 'AUTO_ACCEPTED',
-        activeSignalId: signal.id,
-        positionId: opened.id,
-        signalRisk: signal.risk ?? null,
-        adjustedRisk: decision.adjustedRisk ?? null,
-        autoExecution: {
-          mode: decision.mode,
-          approved: decision.approved,
-          rule: decision.rule,
-          regime: decision.regime,
-          reasons: decision.reasons,
-        },
-      })
-      bundle.signalEngine.notifyPositionAccepted({
-        entryPrice,
-        takeProfit: risk.takeProfit ?? null,
-        stopLoss: risk.stopLoss ?? null,
-      })
-      logger.info(
-        `[SocketAdapter] [RISK-AUTO] opened ${direction} ${symbol} @ ${entryPrice} ` +
-          `(regime=${decision.regime}, conf=${signal.confidence}%, rule=${decision.rule})`,
-      )
-    } catch (err) {
-      if (err?.code !== 'POSITION_ALREADY_OPEN') {
-        logger.warn(`[SocketAdapter] auto-open failed for ${symbol}: ${err.message}`)
+
+    // Compute ATR distances from the signal entry price so they can be
+    // re-anchored to the actual fill price (mark price at execution time).
+    const signalEntry = Number(risk.entryPrice ?? bundle._lastMarkPrice)
+    if (!Number.isFinite(signalEntry)) return
+    const isLong = direction === 'LONG'
+    const rawSL = Number(risk.stopLoss)
+    const rawTP = Number(risk.takeProfit)
+    const slDist = Number.isFinite(rawSL) && Number.isFinite(signalEntry) ? Math.abs(signalEntry - rawSL) : null
+    const tpDist = Number.isFinite(rawTP) && Number.isFinite(signalEntry) ? Math.abs(signalEntry - rawTP) : null
+
+    // Inner function so we can call it immediately or after a setTimeout.
+    const _doOpen = (fillPrice) => {
+      const stopLoss = slDist != null ? +(isLong ? fillPrice - slDist : fillPrice + slDist).toFixed(6) : null
+      const takeProfit = tpDist != null ? +(isLong ? fillPrice + tpDist : fillPrice - tpDist).toFixed(6) : null
+      const b = this._symbolServices.get(symbol)
+      if (!b) return
+      try {
+        const opened = this.paperTradeService.openPosition({
+          symbol,
+          userId: 'risk-manager',
+          direction,
+          entryPrice: fillPrice,
+          quantity: risk.recommendedQuantity ?? risk.quantity ?? signal.quantity ?? null,
+          stopLoss,
+          takeProfit,
+          sourceSignalId: signal.id,
+          autoManaged: true,
+          autoExecutionMeta: {
+            mode: decision.mode,
+            regime: decision.regime,
+            rule: decision.rule,
+            minConfidence: decision.minConfidence,
+            minRiskReward: decision.minRiskReward,
+            reasons: decision.reasons,
+          },
+        })
+        this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_OPENED, opened, {
+          stream: 'paperTrade.opened',
+          symbol,
+        })
+        this._emitPaperPortfolioSnapshot()
+        this._persistPaperPosition(opened)
+        this._persistSignalHistory({
+          timestamp: Date.now(),
+          symbol,
+          interval: b.signalEngine.interval,
+          state: b.signalEngine.getState(),
+          prevState: b.signalEngine.getState(),
+          netScore: signal.score ?? 0,
+          confidence: signal.confidence ?? 0,
+          reasons: decision.reasons ?? [],
+          missingContext: [],
+          decision: 'AUTO_ACCEPTED',
+          activeSignalId: signal.id,
+          positionId: opened.id,
+          signalRisk: signal.risk ?? null,
+          adjustedRisk: decision.adjustedRisk ?? null,
+          autoExecution: {
+            mode: decision.mode,
+            approved: decision.approved,
+            rule: decision.rule,
+            regime: decision.regime,
+            reasons: decision.reasons,
+          },
+        })
+        b.signalEngine.notifyPositionAccepted({
+          direction,
+          entryPrice: fillPrice,
+          takeProfit,
+          stopLoss,
+        })
+        logger.info(
+          `[SocketAdapter] [RISK-AUTO] opened ${direction} ${symbol} @ ${fillPrice} ` +
+            `(signalEntry=${signalEntry}, regime=${decision.regime}, conf=${signal.confidence}%, rule=${decision.rule})`,
+        )
+      } catch (err) {
+        if (err?.code !== 'POSITION_ALREADY_OPEN') {
+          logger.warn(`[SocketAdapter] auto-open failed for ${symbol}: ${err.message}`)
+        }
       }
+    } // end _doOpen
+
+    if (PAPER_FILL_DELAY_MS > 0) {
+      setTimeout(() => {
+        const b2 = this._symbolServices.get(symbol)
+        const fillPrice = b2?._lastMarkPrice ?? signalEntry
+        _doOpen(fillPrice)
+      }, PAPER_FILL_DELAY_MS)
+    } else {
+      _doOpen(bundle._lastMarkPrice ?? signalEntry)
     }
   }
 
@@ -1195,36 +1341,56 @@ class FuturesAssetSocketAdapter {
   _applyAutoManagementAction(symbol, room, position, action, bundle) {
     if (!action || action.action === 'HOLD') return
     if (action.action === 'CLOSE') {
-      const closed = this.paperTradeService.closePosition({
-        symbol,
-        positionId: position.id,
-        closePrice: bundle._lastMarkPrice,
-        closeReason: action.closeReason || 'RISK_MANAGER',
-      })
-      if (!closed) return
-      this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_CLOSED, closed, {
-        stream: 'paperTrade.closed',
-        symbol,
-      })
-      this._persistPaperPosition(closed)
-      this.portfolioManager?.recordPaperClose(closed)
-      this._emitPaperPortfolioSnapshot()
-      this._persistSignalHistory({
-        timestamp: Date.now(),
-        symbol,
-        interval: bundle.signalEngine.interval,
-        state: bundle.signalEngine.getState(),
-        prevState: bundle.signalEngine.getState(),
-        netScore: 0,
-        confidence: 0,
-        reasons: [action.reason || ''],
-        missingContext: [],
-        decision: 'AUTO_CLOSED',
-        activeSignalId: position.sourceSignalId ?? null,
-        positionId: position.id,
-      })
-      bundle.signalEngine.notifyPositionClosed()
-      logger.info(`[SocketAdapter] [RISK-AUTO] closed ${symbol} reason=${action.closeReason}`)
+      // Guard against double-queuing the same close (e.g. risk-manager fires on
+      // the same tick that a TP/SL event is already pending).
+      const positionId = position.id
+      if (bundle._pendingAutoCloseIds.has(positionId)) return
+      bundle._pendingAutoCloseIds.add(positionId)
+      const closeReason = action.closeReason || 'RISK_MANAGER'
+      const closeActionReason = action.reason || ''
+      const sourceSignalId = position.sourceSignalId ?? null
+      setTimeout(() => {
+        const b = this._symbolServices.get(symbol)
+        if (b) b._pendingAutoCloseIds.delete(positionId)
+        const fillPrice = this._symbolServices.get(symbol)?._lastMarkPrice ?? bundle._lastMarkPrice
+        const closed = this.paperTradeService.closePosition({
+          symbol,
+          positionId,
+          closePrice: fillPrice,
+          closeReason,
+        })
+        if (!closed) return
+        this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_CLOSED, closed, {
+          stream: 'paperTrade.closed',
+          symbol,
+        })
+        this._persistPaperPosition(closed)
+        this.portfolioManager?.recordPaperClose(closed)
+        this._emitPaperPortfolioSnapshot()
+        const bAfter = this._symbolServices.get(symbol)
+        this._persistSignalHistory({
+          timestamp: Date.now(),
+          symbol,
+          interval: bAfter?.signalEngine.interval ?? '1m',
+          state: bAfter?.signalEngine.getState() ?? 'UNKNOWN',
+          prevState: bAfter?.signalEngine.getState() ?? 'UNKNOWN',
+          netScore: 0,
+          confidence: 0,
+          reasons: [closeActionReason],
+          missingContext: [],
+          decision: 'AUTO_CLOSED',
+          activeSignalId: sourceSignalId,
+          positionId,
+        })
+        if (bAfter) {
+          bAfter.signalEngine.notifyPositionClosed()
+          bAfter._lastSignalEngineRunAt = 0
+          this._runSignalEngine(symbol, room)
+        }
+        logger.info(
+          `[SocketAdapter] [RISK-AUTO] closed ${symbol} reason=${closeReason} fillPrice=${fillPrice} (delayed ${PAPER_FILL_DELAY_MS}ms)`,
+        )
+      }, PAPER_FILL_DELAY_MS)
       return
     }
     if (action.action === 'ADJUST_SL' && Number.isFinite(action.newStopLoss)) {
@@ -1232,6 +1398,7 @@ class FuturesAssetSocketAdapter {
         symbol,
         positionId: position.id,
         stopLoss: action.newStopLoss,
+        stopLossOrigin: action.stopLossOrigin ?? null,
       })
       if (!updated) return
       this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_UPDATED, updated, {
@@ -1240,9 +1407,7 @@ class FuturesAssetSocketAdapter {
       })
       this._emitPaperPortfolioSnapshot()
       this._persistPaperPosition(updated)
-      logger.debug(
-        `[SocketAdapter] [RISK-AUTO] adjusted SL ${symbol} → ${action.newStopLoss} (${action.reason})`,
-      )
+      logger.debug(`[SocketAdapter] [RISK-AUTO] adjusted SL ${symbol} → ${action.newStopLoss} (${action.reason})`)
     }
   }
 
@@ -1321,6 +1486,7 @@ class FuturesAssetSocketAdapter {
     }
 
     bundle.signalEngine.notifyPositionAccepted({
+      direction,
       entryPrice: data?.entryPrice != null ? Number(data.entryPrice) : null,
       takeProfit: data?.takeProfit != null ? Number(data.takeProfit) : null,
       stopLoss: data?.stopLoss != null ? Number(data.stopLoss) : null,
@@ -1374,7 +1540,13 @@ class FuturesAssetSocketAdapter {
   }
 
   _processPaperTradeTick(symbol, room, price, backendReceivedAt = Date.now()) {
-    const events = this.paperTradeService.onPriceTick({ symbol, price, now: Date.now() })
+    const events = this.paperTradeService.onPriceTick({
+      symbol,
+      price,
+      now: Date.now(),
+      // Defer TP/SL closes so we can simulate fill latency.
+      skipAutoClose: PAPER_FILL_DELAY_MS > 0,
+    })
     if (!events.length) return
 
     for (const event of events) {
@@ -1389,7 +1561,64 @@ class FuturesAssetSocketAdapter {
         continue
       }
 
+      if (event.type === 'PENDING_CLOSE') {
+        // TP/SL condition met — schedule a delayed fill to simulate order
+        // transmission + execution latency in paper mode.
+        const bundle = this._symbolServices.get(symbol)
+        if (!bundle) continue
+        const positionId = event.position.id
+        // Guard: only queue once per position (condition stays true every tick).
+        if (bundle._pendingAutoCloseIds.has(positionId)) continue
+        bundle._pendingAutoCloseIds.add(positionId)
+        const closeReason = event.closeReason
+        setTimeout(() => {
+          const b = this._symbolServices.get(symbol)
+          if (b) b._pendingAutoCloseIds.delete(positionId)
+          const fillPrice = this._symbolServices.get(symbol)?._lastMarkPrice ?? price
+          const closed = this.paperTradeService.closePosition({
+            symbol,
+            positionId,
+            closePrice: fillPrice,
+            closeReason,
+          })
+          if (!closed) return
+          this._emitToRoom(room, FUTURES_SOCKET_EVENTS.PAPER_TRADE_CLOSED, closed, {
+            stream: 'paperTrade.closed',
+            symbol,
+          })
+          this._persistPaperPosition(closed)
+          this.portfolioManager?.recordPaperClose(closed)
+          this._emitPaperPortfolioSnapshot()
+          const bAfter = this._symbolServices.get(symbol)
+          this._persistSignalHistory({
+            timestamp: Date.now(),
+            symbol,
+            interval: bAfter?.signalEngine.interval ?? '1m',
+            state: bAfter?.signalEngine.getState() ?? 'UNKNOWN',
+            prevState: bAfter?.signalEngine.getState() ?? 'UNKNOWN',
+            netScore: 0,
+            confidence: 0,
+            reasons: [closeReason],
+            missingContext: [],
+            decision: 'PAPER_TRADE_CLOSED',
+            activeSignalId: closed.sourceSignalId ?? null,
+            positionId: closed.id,
+          })
+          if (bAfter) {
+            bAfter.signalEngine.notifyPositionClosed()
+            bAfter._lastSignalEngineRunAt = 0
+            this._runSignalEngine(symbol, room)
+          }
+          logger.info(
+            `[SocketAdapter] Paper position auto-closed for ${symbol} reason=${closeReason}` +
+              ` fillPrice=${fillPrice} (delayed ${PAPER_FILL_DELAY_MS}ms)`,
+          )
+        }, PAPER_FILL_DELAY_MS)
+        continue
+      }
+
       if (event.type === 'CLOSED') {
+        // Fallback path when PAPER_FILL_DELAY_MS === 0 (immediate mode).
         this._emitToRoom(room, FUTURES_SOCKET_EVENTS.PAPER_TRADE_CLOSED, event.position, {
           stream: 'paperTrade.closed',
           symbol,
@@ -1413,8 +1642,6 @@ class FuturesAssetSocketAdapter {
           activeSignalId: event.position?.sourceSignalId ?? null,
           positionId: event.position?.id ?? null,
         })
-        // Sync state machine: TP/SL fired autonomously, the engine must exit
-        // LONG_OPEN/SHORT_OPEN so new entry signals can be generated.
         if (bundle) {
           bundle.signalEngine.notifyPositionClosed()
           bundle._lastSignalEngineRunAt = 0
@@ -1466,11 +1693,12 @@ class FuturesAssetSocketAdapter {
           })
           this._emitPaperPortfolioSnapshot()
 
-          // If the restored position was auto-managed, also notify the state
-          // machine so its transitions stay coherent.
+          // Notify the state machine about restored open position so it
+          // resumes in *_POSITION_OPEN instead of emitting fresh entries.
           const bundle = this._symbolServices.get(symbol)
           if (bundle?.signalEngine) {
             bundle.signalEngine.notifyPositionAccepted({
+              direction: restored.direction,
               entryPrice: restored.entryPrice,
               takeProfit: restored.takeProfit,
               stopLoss: restored.stopLoss,
@@ -1677,9 +1905,7 @@ function buildSharedOrderBookContext(ob) {
   for (const l of ob.asks) allQtys[i++] = l.qty
   allQtys.sort((a, b) => a.cmp(b))
   const mid = Math.floor(allQtys.length / 2)
-  const medianQty = allQtys.length % 2 === 0
-    ? allQtys[mid - 1].plus(allQtys[mid]).div(2)
-    : allQtys[mid]
+  const medianQty = allQtys.length % 2 === 0 ? allQtys[mid - 1].plus(allQtys[mid]).div(2) : allQtys[mid]
   return { medianQty }
 }
 

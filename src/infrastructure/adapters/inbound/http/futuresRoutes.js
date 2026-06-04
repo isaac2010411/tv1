@@ -22,6 +22,7 @@ const createFuturesAssetRouter = (controller) => {
   /**
    * GET /api/futures/assets/:symbol/context
    * Returns the full Futures Asset Trading Context for a symbol.
+   * @deprecated Prefer Socket.IO ASSET_CONTEXT payload after subscribe.
    */
   router.get('/assets/:symbol/context', (req, res) => controller.getAssetContext(req, res))
 

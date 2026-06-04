@@ -61,8 +61,8 @@ describe('computeNetEdgeBps', () => {
 
 describe('evaluateSignal — cost-aware gate & sizing', () => {
   const baseFactors = {
-    atrPct: 0.002,   // NORMAL regime
-    atr: 0.5,        // ATR=0.5 on a $100 asset → tpAtrMult≈1.85×1.2=2.22 → tpDist≈1.1 → ~110 bps
+    atrPct: 0.002, // NORMAL regime
+    atr: 0.5, // ATR=0.5 on a $100 asset → tpAtrMult≈1.85×1.2=2.22 → tpDist≈1.1 → ~110 bps
     price: 100,
     spreadPct: 0.0005,
   }
@@ -177,7 +177,7 @@ describe('evaluateActivePosition — time-stop', () => {
       position: basePosition,
       markPrice: 100.1, // 10% of TP distance
       now: 1_000 + 60_000,
-      config: { timeStopMs: 60_000, minTpProgress: 0.30 },
+      config: { timeStopMs: 60_000, minTpProgress: 0.3 },
     })
     expect(r.action).toBe(POSITION_ACTION.CLOSE)
     expect(r.closeReason).toBe('TIME_STOP')
@@ -188,19 +188,69 @@ describe('evaluateActivePosition — time-stop', () => {
       position: basePosition,
       markPrice: 100.5, // 50% of TP distance
       now: 1_000 + 60_000,
-      config: { timeStopMs: 60_000, minTpProgress: 0.30 },
+      config: { timeStopMs: 60_000, minTpProgress: 0.3 },
     })
     // either HOLD or ADJUST_SL, never TIME_STOP CLOSE
     expect(r.closeReason).not.toBe('TIME_STOP')
   })
 
   test('signal-driven exits still take priority over time-stop', () => {
+    // price below entry (atLoss) + 2 consecutive ticks → close
     const r = evaluateActivePosition({
       position: basePosition,
-      markPrice: 100.1,
+      markPrice: 99.5,
       now: 1_000 + 60_000,
       signalState: 'LONG_EXIT_SIGNAL',
+      consecutiveExitTicks: 2,
       config: { timeStopMs: 60_000 },
+    })
+    expect(r.action).toBe(POSITION_ACTION.CLOSE)
+    expect(r.closeReason).toBe('SIGNAL_EXIT')
+  })
+
+  test('EXIT_SIGNAL does NOT close on first tick even at a loss', () => {
+    const r = evaluateActivePosition({
+      position: basePosition,
+      markPrice: 99.5,
+      signalState: 'LONG_EXIT_SIGNAL',
+      consecutiveExitTicks: 1,
+    })
+    expect(r.action).not.toBe(POSITION_ACTION.CLOSE)
+  })
+
+  test('EXIT_SIGNAL does NOT close when position is in profit and no other conditions met', () => {
+    const r = evaluateActivePosition({
+      position: basePosition,
+      markPrice: 100.5,
+      now: 1_000 + 1_000,
+      signalState: 'LONG_EXIT_SIGNAL',
+      consecutiveExitTicks: 3,
+    })
+    expect(r.action).not.toBe(POSITION_ACTION.CLOSE)
+  })
+
+  test('EXIT_SIGNAL closes when time-guard elapsed (≥ 2 ticks)', () => {
+    const r = evaluateActivePosition({
+      position: basePosition,
+      markPrice: 100.5,
+      signalIssuedAt: 0,
+      now: 20_000,
+      signalState: 'LONG_EXIT_SIGNAL',
+      consecutiveExitTicks: 2,
+      config: { exitGuardMs: 15_000 },
+    })
+    expect(r.action).toBe(POSITION_ACTION.CLOSE)
+    expect(r.closeReason).toBe('SIGNAL_EXIT')
+  })
+
+  test('EXIT_SIGNAL closes when opposing score exceeds threshold (≥ 2 ticks)', () => {
+    const r = evaluateActivePosition({
+      position: basePosition,
+      markPrice: 100.5,
+      signalState: 'LONG_EXIT_SIGNAL',
+      netScore: -0.7,
+      consecutiveExitTicks: 2,
+      config: { exitOpposingScoreThreshold: 0.55 },
     })
     expect(r.action).toBe(POSITION_ACTION.CLOSE)
     expect(r.closeReason).toBe('SIGNAL_EXIT')

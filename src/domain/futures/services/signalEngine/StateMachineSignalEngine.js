@@ -1,14 +1,10 @@
 'use strict'
 
-const { evaluateMarketContext }  = require('./MarketContextEvaluator')
-const { calculateScore }         = require('./SignalScoringService')
-const { resolveNextState }       = require('./SignalTransitionService')
+const { evaluateMarketContext } = require('./MarketContextEvaluator')
+const { calculateScore } = require('./SignalScoringService')
+const { resolveNextState } = require('./SignalTransitionService')
 const { createSignal, stateRequiresSignal } = require('./SignalFactory')
-const {
-  SIGNAL_STATES,
-  ENTRY_SIGNAL_STATES,
-  POSITION_ACTIVE_STATES,
-} = require('./signalEngineStates')
+const { SIGNAL_STATES, ENTRY_SIGNAL_STATES, POSITION_ACTIVE_STATES } = require('./signalEngineStates')
 
 /**
  * Domain Service: orchestrates the state machine signal engine for one symbol.
@@ -26,34 +22,34 @@ const {
 class StateMachineSignalEngine {
   constructor({ interval = '1m', horizon = 'default', minEntryExpiryMs = 0, minExitExpiryMs = 0 } = {}) {
     this.interval = interval
-    this.horizon  = horizon === 'scalp' ? 'scalp' : 'default'
+    this.horizon = horizon === 'scalp' ? 'scalp' : 'default'
     this._minEntryExpiryMs = Number.isFinite(minEntryExpiryMs) && minEntryExpiryMs > 0 ? minEntryExpiryMs : 0
-    this._minExitExpiryMs  = Number.isFinite(minExitExpiryMs)  && minExitExpiryMs  > 0 ? minExitExpiryMs  : 0
+    this._minExitExpiryMs = Number.isFinite(minExitExpiryMs) && minExitExpiryMs > 0 ? minExitExpiryMs : 0
 
     /** @type {string} */
-    this._state          = SIGNAL_STATES.IDLE
+    this._state = SIGNAL_STATES.IDLE
     /** @type {number} */
     this._stateEnteredAt = Date.now()
     /** @type {object|null} */
-    this._lastSignal     = null
+    this._lastSignal = null
     /** @type {number|null} */
     this._signalIssuedAt = null
 
     // Position state communicated by the frontend
     /** @type {boolean} */
-    this._hasPosition        = false
+    this._hasPosition = false
     /** @type {'long'|'short'|null} */
-    this._positionDirection  = null
+    this._positionDirection = null
     /** @type {number|null} */
     this._positionEntryPrice = null
     /** @type {number|null} */
     this._positionTakeProfit = null
     /** @type {number|null} */
-    this._positionStopLoss   = null
+    this._positionStopLoss = null
     /** @type {boolean} */
-    this._positionAccepted   = false
+    this._positionAccepted = false
     /** @type {boolean} */
-    this._positionClosed     = false
+    this._positionClosed = false
   }
 
   // ─── Position notifications (called from socket command handlers) ───────────
@@ -67,15 +63,35 @@ class StateMachineSignalEngine {
    * @param {number|null} [positionCtx.takeProfit]
    * @param {number|null} [positionCtx.stopLoss]
    */
-  notifyPositionAccepted({ entryPrice = null, takeProfit = null, stopLoss = null } = {}) {
-    this._positionAccepted   = true
-    this._hasPosition        = true
+  notifyPositionAccepted({ direction = null, entryPrice = null, takeProfit = null, stopLoss = null } = {}) {
+    const directionInput = direction
+    const normalizedDirection = typeof directionInput === 'string' ? directionInput.trim().toLowerCase() : null
+
+    this._positionAccepted = true
+    this._hasPosition = true
     this._positionEntryPrice = entryPrice
     this._positionTakeProfit = takeProfit
-    this._positionStopLoss   = stopLoss
-    this._positionDirection  = ENTRY_SIGNAL_STATES.has(this._state)
-      ? (this._state.startsWith('LONG') ? 'long' : 'short')
-      : this._positionDirection
+    this._positionStopLoss = stopLoss
+    this._positionDirection =
+      normalizedDirection === 'long' || normalizedDirection === 'short'
+        ? normalizedDirection
+        : ENTRY_SIGNAL_STATES.has(this._state)
+          ? this._state.startsWith('LONG')
+            ? 'long'
+            : 'short'
+          : this._positionDirection
+
+    // Restore/accept can happen while the machine is not in *_ENTRY_SIGNAL
+    // (e.g. page reconnect). Force an in-position state immediately so
+    // entry transitions do not continue emitting new entry signals.
+    if (!POSITION_ACTIVE_STATES.has(this._state)) {
+      if (this._positionDirection === 'long') {
+        this._state = SIGNAL_STATES.LONG_POSITION_OPEN
+      } else if (this._positionDirection === 'short') {
+        this._state = SIGNAL_STATES.SHORT_POSITION_OPEN
+      }
+      this._stateEnteredAt = Date.now()
+    }
   }
 
   /**
@@ -83,12 +99,12 @@ class StateMachineSignalEngine {
    * Causes the state machine to transition to COOLDOWN on the next tick.
    */
   notifyPositionClosed() {
-    this._positionClosed     = true
-    this._hasPosition        = false
-    this._positionDirection  = null
+    this._positionClosed = true
+    this._hasPosition = false
+    this._positionDirection = null
     this._positionEntryPrice = null
     this._positionTakeProfit = null
-    this._positionStopLoss   = null
+    this._positionStopLoss = null
   }
 
   // ─── Main process method ─────────────────────────────────────────────────────
@@ -108,22 +124,24 @@ class StateMachineSignalEngine {
    */
   process(symbol, ctx) {
     const prevState = this._state
-    const now       = Date.now()
+    const now = Date.now()
 
     // 1. Evaluate market factors
     const factors = evaluateMarketContext({
-      orderBook:           ctx.orderBook  ?? null,
-      candleHistory:       ctx.candleHistory ?? new Map(),
-      cvdHistory:          ctx.cvdHistory ?? [],
-      spoofingCandidates:  ctx.spoofingCandidates ?? [],
-      markPrice:           ctx.markPrice ?? null,
-      interval:            this.interval,
-      positionContext:     this._hasPosition ? {
-        direction:   this._positionDirection,
-        entryPrice:  this._positionEntryPrice,
-        takeProfit:  this._positionTakeProfit,
-        stopLoss:    this._positionStopLoss,
-      } : null,
+      orderBook: ctx.orderBook ?? null,
+      candleHistory: ctx.candleHistory ?? new Map(),
+      cvdHistory: ctx.cvdHistory ?? [],
+      spoofingCandidates: ctx.spoofingCandidates ?? [],
+      markPrice: ctx.markPrice ?? null,
+      interval: this.interval,
+      positionContext: this._hasPosition
+        ? {
+            direction: this._positionDirection,
+            entryPrice: this._positionEntryPrice,
+            takeProfit: this._positionTakeProfit,
+            stopLoss: this._positionStopLoss,
+          }
+        : null,
     })
 
     // 2. Calculate score
@@ -133,12 +151,12 @@ class StateMachineSignalEngine {
     //    volt = 1.0 → medium reference (ATR ≈ 0.3% of price, e.g. BTC ~270 on $90k)
     //    volt < 1.0 → low vol (e.g. XRP 1m) → tighter thresholds, faster signals
     //    volt > 1.0 → high vol → require stronger confirmation
-    const atrPct    = factors.atrPct ?? 0.003
+    const atrPct = factors.atrPct ?? 0.003
     const spreadPct = factors.spreadPct ?? 0
-    const volt      = Math.min(Math.max(atrPct / 0.003, 0.4), 2.5)
+    const volt = Math.min(Math.max(atrPct / 0.003, 0.4), 2.5)
 
     // Linear scale: volt=0.4 → ×0.88; volt=1.0 → ×1.00; volt=2.5 → ×1.30
-    const ts  = (base) => +(base * (0.80 + 0.20 * volt)).toFixed(3)
+    const ts = (base) => +(base * (0.8 + 0.2 * volt)).toFixed(3)
     // Spread surcharge on entry: wide spread requires stronger conviction
     const spl = spreadPct > 0.001 ? +Math.min(spreadPct * 8, 0.06).toFixed(3) : 0
 
@@ -151,40 +169,40 @@ class StateMachineSignalEngine {
     //   exitWarn:      ts(0.27),                             // reuses bias level
     //   exitRecover:   ts(0.45),                             // reuses setup level
     // }
-const thresholds = {
-  observe:       ts(0.08),
-  bias:          ts(0.12),
-  setup:         ts(0.20),
-  entry:         +(ts(0.28) + spl).toFixed(3),
-  minConfidence: Math.round(28 + 10 * Math.min(volt, 1.0)),
-  exitWarn:      ts(0.12),
-  exitRecover:   ts(0.20),
-}
+    const thresholds = {
+      observe: ts(0.08),
+      bias: ts(0.12),
+      setup: ts(0.2),
+      entry: +(ts(0.28) + spl).toFixed(3),
+      minConfidence: Math.round(28 + 10 * Math.min(volt, 1.0)),
+      exitWarn: ts(0.12),
+      exitRecover: ts(0.2),
+    }
     // Timing: fast for low-vol scalping, conservative for high-vol assets.
     // Apply optional floors (used in semi-manual mode to keep the human
     // approval popup alive long enough).
     const timing = {
-      cooldownMs:    Math.max(15_000, Math.round(20_000 * volt)),  // 15s → 50s
-      entryExpiryMs: Math.max(this._minEntryExpiryMs, 10_000, Math.round(12_000 * volt)),  // 10s → 30s
-      exitExpiryMs:  Math.max(this._minExitExpiryMs,  15_000, Math.round(18_000 * volt)),  // 15s → 45s
+      cooldownMs: Math.max(15_000, Math.round(20_000 * volt)), // 15s → 50s
+      entryExpiryMs: Math.max(this._minEntryExpiryMs, 10_000, Math.round(12_000 * volt)), // 10s → 30s
+      exitExpiryMs: Math.max(this._minExitExpiryMs, 15_000, Math.round(18_000 * volt)), // 15s → 45s
     }
 
     // 4. Build transition context
-    const stateAgeMs  = now - this._stateEnteredAt
+    const stateAgeMs = now - this._stateEnteredAt
     const signalAgeMs = this._signalIssuedAt ? now - this._signalIssuedAt : 0
 
     const transCtx = {
       netScore,
       confidence,
-      hasPosition:       this._hasPosition,
+      hasPosition: this._hasPosition,
       positionDirection: this._positionDirection,
-      positionAccepted:  this._positionAccepted,
-      positionClosed:    this._positionClosed,
-      nearTakeProfit:    factors.nearTakeProfit    ?? false,
-      nearInvalidation:  factors.nearInvalidation  ?? false,
+      positionAccepted: this._positionAccepted,
+      positionClosed: this._positionClosed,
+      nearTakeProfit: factors.nearTakeProfit ?? false,
+      nearInvalidation: factors.nearInvalidation ?? false,
       stateAgeMs,
       signalAgeMs,
-      currentState:      this._state,
+      currentState: this._state,
       thresholds,
       timing,
     }
@@ -194,13 +212,13 @@ const thresholds = {
     const stateChanged = nextState !== prevState
 
     if (stateChanged) {
-      this._state          = nextState
+      this._state = nextState
       this._stateEnteredAt = now
     }
 
     // 6. Reset one-shot flags after they have been consumed
     this._positionAccepted = false
-    this._positionClosed   = false
+    this._positionClosed = false
 
     // 7. Emit a signal if required
     let signal = null
@@ -208,7 +226,7 @@ const thresholds = {
       if (stateChanged || this._lastSignal?.state !== this._state) {
         signal = createSignal({
           symbol,
-          state:          this._state,
+          state: this._state,
           netScore,
           confidence,
           reasons,
@@ -217,7 +235,7 @@ const thresholds = {
           timing,
         })
         if (signal) {
-          this._lastSignal     = signal
+          this._lastSignal = signal
           this._signalIssuedAt = now
         }
       }
@@ -236,14 +254,14 @@ const thresholds = {
     }
 
     return {
-      state:        this._state,
+      state: this._state,
       prevState,
       stateChanged,
-      netScore:     +netScore.toFixed(4),
+      netScore: +netScore.toFixed(4),
       confidence,
       signal,
       activeSignal,
-      hasPosition:  this._hasPosition,
+      hasPosition: this._hasPosition,
       positionDirection: this._positionDirection,
       reasons,
       missingContext: factors.missingContext,
@@ -253,23 +271,29 @@ const thresholds = {
 
   // ─── Accessors ────────────────────────────────────────────────────────────
 
-  getState()        { return this._state }
-  getActiveSignal() { return this._lastSignal }
-  isInPosition()    { return this._hasPosition }
+  getState() {
+    return this._state
+  }
+  getActiveSignal() {
+    return this._lastSignal
+  }
+  isInPosition() {
+    return this._hasPosition
+  }
 
   /** Reset all state (call on symbol unsubscribe). */
   reset() {
-    this._state             = SIGNAL_STATES.IDLE
-    this._stateEnteredAt    = Date.now()
-    this._lastSignal        = null
-    this._signalIssuedAt    = null
-    this._hasPosition       = false
-    this._positionDirection  = null
+    this._state = SIGNAL_STATES.IDLE
+    this._stateEnteredAt = Date.now()
+    this._lastSignal = null
+    this._signalIssuedAt = null
+    this._hasPosition = false
+    this._positionDirection = null
     this._positionEntryPrice = null
     this._positionTakeProfit = null
-    this._positionStopLoss   = null
-    this._positionAccepted  = false
-    this._positionClosed    = false
+    this._positionStopLoss = null
+    this._positionAccepted = false
+    this._positionClosed = false
   }
 }
 

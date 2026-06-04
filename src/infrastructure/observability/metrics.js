@@ -167,6 +167,21 @@ const metrics = {
   socketEmits: registry.counter('socketio_emit_total', 'Socket.IO emits {event,symbol}'),
   socketEmitLatencyMs: registry.histogram('socketio_emit_latency_ms', 'Emit duration (ms)'),
 
+  // asset context
+  assetContextBuildTimeMs: registry.histogram(
+    'asset_context_build_time',
+    'Asset context build duration (ms) {symbol,reason}',
+  ),
+  assetContextEmitCount: registry.counter('asset_context_emit_count', 'Asset context emits {symbol,target,reason}'),
+  assetContextEmitSize: registry.histogram(
+    'asset_context_emit_size',
+    'Serialized asset context payload size (bytes) {symbol,target,reason}',
+  ),
+  assetContextRestDeprecatedHits: registry.counter(
+    'asset_context_rest_deprecated_total',
+    'Deprecated REST asset-context endpoint hits',
+  ),
+
   // order book
   orderBookLevels: registry.gauge('orderbook_levels', 'Levels in local book {symbol,side}'),
   orderBookEmitLatencyMs: registry.histogram('orderbook_emit_latency_ms', 'OrderBook emit duration (ms)'),

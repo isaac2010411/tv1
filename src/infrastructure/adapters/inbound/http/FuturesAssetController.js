@@ -3,6 +3,9 @@
 const { DomainError } = require('../../../../shared/errors/DomainError')
 const { ApplicationError } = require('../../../../shared/errors/ApplicationError')
 const { InfrastructureError } = require('../../../../shared/errors/InfrastructureError')
+const { assertAssetContext } = require('../../../../shared/contracts/AssetContextContract')
+const { logger } = require('../../../../shared/utils/logger')
+const { metrics } = require('../../../observability/metrics')
 
 /**
  * Inbound HTTP adapter: handles Express requests for futures asset endpoints.
@@ -37,6 +40,8 @@ class FuturesAssetController {
 
   /**
    * GET /api/futures/assets/:symbol/context
+   * @deprecated Use Socket.IO bootstrap event futures:asset:context after
+   * futures:asset:subscribe. Kept temporarily for backward compatibility.
    */
   async getAssetContext(req, res) {
     const { symbol } = req.params
@@ -45,8 +50,17 @@ class FuturesAssetController {
       return res.status(400).json({ error: 'symbol param is required' })
     }
 
+    // Explicit deprecation signal for clients and observability.
+    if (typeof res.set === 'function') {
+      res.set('Deprecation', 'true')
+      res.set('Sunset', '2026-12-31')
+    }
+    metrics.assetContextRestDeprecatedHits.inc({})
+    logger.warn(`[DEPRECATED_REST_ASSET_CONTEXT] symbol=${symbol.trim().toUpperCase()}`)
+
     try {
       const context = await this.getAssetContextUseCase.execute({ symbol })
+      assertAssetContext(context, { channel: 'rest' })
       return res.json(context)
     } catch (err) {
       return this._handleError(res, err)
