@@ -85,9 +85,119 @@ describe('PortfolioManager.getSnapshot', () => {
 
     expect(snap.totalRealized).toBe(40)
     expect(snap.totalUnrealized).toBe(60)
-    expect(snap.liveSummary.realizedPnl).toBe(40)
+    expect(snap.liveSummary.realizedPnl).toBe(0)
     expect(snap.paperSummary.realizedPnl).toBe(40)
     expect(snap.paperSummary.equity).toBe(10_100)
+  })
+
+  test('keeps live account state separate from paper fills', async () => {
+    const pm = new PortfolioManager({ startingEquity: 10_000 })
+    await pm.applyFill(makeFill({ side: 'BUY', quantity: 1, price: 100 }))
+    pm.applyExchangeAccountUpdate({
+      balances: [{ asset: 'USDT', walletBalance: 250, availableBalance: 200 }],
+      positions: [{ symbol: 'ETHUSDT', positionAmt: -2, entryPrice: 50, unrealizedPnl: 5 }],
+    })
+
+    const snap = await pm.getSnapshot()
+
+    expect(snap.paperSummary.openCount).toBe(1)
+    expect(snap.liveSummary.openCount).toBe(1)
+    expect(snap.liveSummary.equity).toBe(200)
+    expect(snap.liveSummary.balance).toBe(250)
+    expect(snap.liveSummary.walletBalance).toBe(250)
+    expect(snap.liveSummary.availableBalance).toBe(200)
+    expect(snap.liveBalance).toMatchObject({ asset: 'USDT', walletBalance: 250 })
+    expect(snap.livePositions[0]).toMatchObject({ symbol: 'ETHUSDT', direction: 'SHORT', quantity: 2 })
+  })
+
+  test('normalizes live position side from signed amount instead of Binance BOTH mode', async () => {
+    const pm = new PortfolioManager({ startingEquity: 10_000 })
+    pm.applyExchangeAccountUpdate({
+      positions: [{ symbol: 'ETHUSDT', side: 'BOTH', positionAmt: -2, entryPrice: 50, unrealizedPnl: 5 }],
+    })
+
+    const position = pm.getLiveOpenPositionForSymbol('ETHUSDT')
+
+    expect(position).toMatchObject({
+      symbol: 'ETHUSDT',
+      side: 'SHORT',
+      direction: 'SHORT',
+      positionSide: 'BOTH',
+    })
+  })
+
+  test('adds take profit and stop loss from the live opening order to live positions', async () => {
+    const pm = new PortfolioManager({ startingEquity: 10_000 })
+    pm.applyExchangeOrderUpdate({
+      mode: 'live',
+      clientOrderId: 'live-entry-1',
+      symbol: 'BTCUSDT',
+      side: 'BUY',
+      status: 'FILLED',
+      reduceOnly: false,
+      stopLoss: 99,
+      takeProfit: 105,
+      sourceSignalId: 'signal-1',
+    })
+    pm.applyExchangeAccountUpdate({
+      positions: [{ symbol: 'BTCUSDT', positionAmt: 1, entryPrice: 100, unrealizedPnl: 2 }],
+    })
+
+    const snap = await pm.getSnapshot()
+
+    expect(snap.livePositions[0]).toMatchObject({
+      symbol: 'BTCUSDT',
+      direction: 'LONG',
+      stopLoss: 99,
+      takeProfit: 105,
+      sourceSignalId: 'signal-1',
+    })
+  })
+
+  test('patches take profit and stop loss onto an existing live position', async () => {
+    const pm = new PortfolioManager({ startingEquity: 10_000 })
+    pm.applyExchangeAccountUpdate({
+      positions: [{ symbol: 'BTCUSDT', positionAmt: 1, entryPrice: 100, unrealizedPnl: 2 }],
+    })
+    pm.applyExchangeOrderUpdate({
+      mode: 'live',
+      clientOrderId: 'live-entry-1',
+      symbol: 'BTCUSDT',
+      side: 'BUY',
+      status: 'FILLED',
+      reduceOnly: false,
+      stopLoss: '98.5',
+      takeProfit: '106.25',
+    })
+
+    const position = pm.getLiveOpenPositionForSymbol('BTCUSDT')
+
+    expect(position).toMatchObject({
+      stopLoss: 98.5,
+      takeProfit: 106.25,
+    })
+  })
+
+  test('exposes live orders and Mongo paper history without mixing equity', async () => {
+    const tradingPersistence = {
+      listPaperPositions: jest.fn(async () => ({
+        items: [{ positionId: 'paper-1', symbol: 'BTCUSDT', status: 'CLOSED', realizedPnl: 12 }],
+        total: 1,
+        page: 1,
+        limit: 100,
+      })),
+    }
+    const pm = new PortfolioManager({ tradingPersistence, startingEquity: 10_000 })
+    pm.applyExchangeAccountUpdate({ balances: [{ asset: 'USDT', walletBalance: 300 }] })
+    pm.applyExchangeOrderUpdate({ clientOrderId: 'live-1', symbol: 'BTCUSDT', status: 'FILLED' })
+
+    const snap = await pm.getSnapshot()
+
+    expect(snap.liveSummary.equity).toBe(300)
+    expect(snap.liveOrders).toHaveLength(1)
+    expect(snap.paperPositions).toHaveLength(1)
+    expect(snap.paperPositions[0]).toMatchObject({ positionId: 'paper-1' })
+    expect(tradingPersistence.listPaperPositions).toHaveBeenCalledWith({ userId: undefined, limit: 100, page: 1 })
   })
 
   test('includes fully closed realized pnl in paper summary equity', async () => {

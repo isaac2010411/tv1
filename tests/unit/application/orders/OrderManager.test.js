@@ -60,6 +60,23 @@ describe('OrderManager.submit', () => {
     expect(portfolio.applyFill).toHaveBeenCalledWith(expect.objectContaining({ status: 'FILLED' }))
   })
 
+  test('derives executed quantity and notional from returned fills', async () => {
+    const repo = makeInMemoryRepo()
+    const om = new OrderManager({
+      orderRepository: repo,
+      riskGuard: allowGuard,
+      exchangeClient: fillingClient(125),
+      portfolioManager: { getSnapshot: async () => ({ positions: [], dailyPnl: 0 }), applyFill: async () => null },
+    })
+
+    const order = await om.submit({ symbol: 'BTCUSDT', side: 'BUY', type: 'MARKET', quantity: 0.002 })
+
+    expect(order.executedQuantity).toBe(0.002)
+    expect(order.averageFillPrice).toBe(125)
+    expect(order.lastFillPrice).toBe(125)
+    expect(order.grossNotional).toBe(0.25)
+  })
+
   test('REDUCE adjusts quantity before submitting to exchange', async () => {
     const repo = makeInMemoryRepo()
     const exchange = fillingClient(50)
@@ -72,6 +89,57 @@ describe('OrderManager.submit', () => {
     const order = await om.submit({ symbol: 'BTCUSDT', side: 'BUY', type: 'MARKET', quantity: 10 })
     expect(order.quantity).toBe(2)
     expect(exchange.submit).toHaveBeenCalledWith(expect.objectContaining({ quantity: 2 }))
+  })
+
+  test('persists precomputed clientOrderId before exchange submit returns', async () => {
+    const repo = makeInMemoryRepo()
+    const exchange = {
+      getClientOrderId: jest.fn(({ orderId }) => `tv1_${orderId.replace(/-/g, '').slice(0, 24)}`),
+      submit: jest.fn(async (order) => ({
+        status: 'NEW',
+        clientOrderId: order.clientOrderId,
+        exchangeOrderId: '123',
+        fills: [],
+      })),
+      cancel: jest.fn(),
+    }
+    const om = new OrderManager({
+      orderRepository: repo,
+      riskGuard: allowGuard,
+      exchangeClient: exchange,
+      portfolioManager: { getSnapshot: async () => ({ positions: [], dailyPnl: 0 }) },
+    })
+
+    await om.submit({ symbol: 'BTCUSDT', side: 'SELL', type: 'MARKET', quantity: 0.001 })
+    const firstSave = repo.save.mock.calls[0][0]
+
+    expect(firstSave.status).toBe('NEW')
+    expect(firstSave.clientOrderId).toMatch(/^tv1_/)
+    expect(exchange.submit).toHaveBeenCalledWith(expect.objectContaining({ clientOrderId: firstSave.clientOrderId }))
+  })
+
+  test('live filled orders stay in futures orders and do not write paper positions', async () => {
+    const repo = makeInMemoryRepo()
+    const portfolio = {
+      getSnapshot: jest.fn(async () => ({ positions: [], dailyPnl: 0 })),
+      applyFill: jest.fn(async () => 'paper-pos-1'),
+    }
+    const om = new OrderManager({
+      orderRepository: repo,
+      riskGuard: allowGuard,
+      exchangeClient: fillingClient(100),
+      portfolioManager: portfolio,
+    })
+
+    const order = await om.submit({ mode: 'live', symbol: 'BTCUSDT', side: 'BUY', type: 'MARKET', quantity: 1 })
+
+    expect(order.status).toBe('FILLED')
+    expect(order.mode).toBe('live')
+    expect(order.positionId).toBeNull()
+    expect(portfolio.applyFill).not.toHaveBeenCalled()
+    expect(repo.save).toHaveBeenCalledTimes(2)
+    expect(Array.from(repo._map.values())).toHaveLength(1)
+    expect(Array.from(repo._map.values())[0]).toMatchObject({ mode: 'live', status: 'FILLED' })
   })
 
   test('BLOCK throws RiskViolationError and does not call exchange', async () => {

@@ -52,6 +52,9 @@ class AssetContextManager {
       throw new ApplicationError(`Symbol ${normalizedSymbol} is not in TRADING status`, 'SYMBOL_NOT_TRADING')
     }
 
+    const liveSummary = portfolio?.liveSummary ?? null
+    const liveBalance = portfolio?.liveBalance ?? null
+
     return {
       symbol: normalizedSymbol,
       exchangeInfo: symbolInfo,
@@ -72,6 +75,8 @@ class AssetContextManager {
       signals: null,
       risk: this.riskManager?.getLimits?.() ?? null,
       portfolio,
+      liveSummary,
+      liveBalance,
       orderFlow: null,
     }
   }

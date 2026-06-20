@@ -37,7 +37,8 @@ class BinanceFuturesAccountAdapter extends FuturesAccountPort {
 
   async getOpenPositions(symbol) {
     try {
-      const raw = await this.client.futuresPositionRisk({ symbol })
+      const query = symbol ? { symbol } : undefined
+      const raw = await this.client.futuresPositionRisk(query)
       return raw
         .filter((p) => parseFloat(p.positionAmt) !== 0)
         .map((p) => new Position({
@@ -56,7 +57,8 @@ class BinanceFuturesAccountAdapter extends FuturesAccountPort {
 
   async getOpenOrders(symbol) {
     try {
-      const raw = await this.client.futuresOpenOrders({ symbol })
+      const query = symbol ? { symbol } : undefined
+      const raw = await this.client.futuresOpenOrders(query)
       return raw.map((o) => new OpenOrder({
         orderId:      o.orderId,
         symbol:       o.symbol,
@@ -76,16 +78,62 @@ class BinanceFuturesAccountAdapter extends FuturesAccountPort {
 
   async getAvailableBalance() {
     try {
+      if (typeof this.client.futuresAccountInfo === 'function') {
+        const accountInfo = await this.client.futuresAccountInfo()
+        const balancesConvertidos = (accountInfo.assets ?? []).map((balance) => Object.assign({}, balance))
+        const usdtBalance = balancesConvertidos.find((balance) => balance.asset === 'USDT')
+        return this._normalizeUsdtBalance(usdtBalance)
+      }
       const balances = await this.client.futuresAccountBalance()
       const usdt     = balances.find((b) => b.asset === 'USDT') ?? {}
-      return {
-        asset:               'USDT',
-        balance:             usdt.balance             ?? '0',
-        availableBalance:    usdt.availableBalance    ?? '0',
-        crossWalletBalance:  usdt.crossWalletBalance  ?? '0',
-      }
+      return this._normalizeUsdtBalance(usdt)
     } catch (err) {
       throw new InfrastructureError(`getAvailableBalance failed: ${err.message}`, 'BINANCE_BALANCE_ERROR')
+    }
+  }
+
+  _normalizeUsdtBalance(balance = {}) {
+    const availableBalance = parseFloat(balance.availableBalance ?? 0)
+    const walletBalance = parseFloat(balance.walletBalance ?? balance.balance ?? balance.marginBalance ?? availableBalance)
+    const marginBalance = parseFloat(balance.marginBalance ?? balance.walletBalance ?? balance.balance ?? availableBalance)
+    const crossWalletBalance = parseFloat(balance.crossWalletBalance ?? balance.walletBalance ?? balance.balance ?? 0)
+    const unrealizedProfit = parseFloat(balance.unrealizedProfit ?? 0)
+
+    return {
+      asset: 'USDT',
+      balance: Number.isFinite(walletBalance) ? walletBalance : 0,
+      walletBalance: Number.isFinite(walletBalance) ? walletBalance : 0,
+      marginBalance: Number.isFinite(marginBalance) ? marginBalance : 0,
+      availableBalance: Number.isFinite(availableBalance) ? availableBalance : 0,
+      crossWalletBalance: Number.isFinite(crossWalletBalance) ? crossWalletBalance : 0,
+      unrealizedProfit: Number.isFinite(unrealizedProfit) ? unrealizedProfit : 0,
+    }
+  }
+
+  async getAllOpenPositions() {
+    return this.getOpenPositions()
+  }
+
+  async getAllOpenOrders() {
+    return this.getOpenOrders()
+  }
+
+  async getAccountSnapshot() {
+    try {
+      const [balance, positions, openOrders] = await Promise.all([
+        this.getAvailableBalance(),
+        this.getAllOpenPositions(),
+        this.getAllOpenOrders(),
+      ])
+      return {
+        balances: [balance],
+        positions,
+        openOrders,
+        timestamp: Date.now(),
+      }
+    } catch (err) {
+      if (err.name === 'InfrastructureError') throw err
+      throw new InfrastructureError(`getAccountSnapshot failed: ${err.message}`, 'BINANCE_ACCOUNT_SNAPSHOT_ERROR')
     }
   }
 }

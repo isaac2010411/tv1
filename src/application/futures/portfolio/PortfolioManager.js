@@ -44,6 +44,11 @@ class PortfolioManager extends PortfolioManagerPort {
     this._paperRealizedToDate = 0
     this._paperBootstrapped = false
     this._countedPaperCloseIds = new Set()
+
+    this._liveBalances = new Map()
+    this._livePositions = new Map()
+    this._liveOrders = new Map()
+    this._liveRiskBySymbol = new Map()
   }
 
   /**
@@ -134,6 +139,235 @@ class PortfolioManager extends PortfolioManagerPort {
   /** Convenience used by the adapter to size positions against live equity. */
   getPaperEquity() {
     return this._paperStartingEquity + this._paperRealizedToDate
+  }
+
+  getExecutionEquity(mode) {
+    return mode === 'live' ? this.getLiveEquity() : this.getPaperEquity()
+  }
+
+  applyExchangeAccountSnapshot(snapshot = {}) {
+    this._liveBalances.clear()
+    this._livePositions.clear()
+    this._liveOrders.clear()
+    const openSymbols = new Set()
+
+    for (const balance of snapshot.balances ?? []) {
+      const asset = balance.asset ?? 'USDT'
+      this._liveBalances.set(asset, {
+        asset,
+        walletBalance: Number(balance.walletBalance ?? balance.balance ?? 0),
+        availableBalance: Number(balance.availableBalance ?? 0),
+        crossWalletBalance: Number(balance.crossWalletBalance ?? 0),
+        balanceChange: Number(balance.balanceChange ?? 0),
+      })
+    }
+
+    for (const position of snapshot.positions ?? []) {
+      const normalized = this._normalizeLivePosition(position)
+      if (normalized && normalized.direction !== 'FLAT') {
+        this._livePositions.set(normalized.symbol, normalized)
+        openSymbols.add(normalized.symbol)
+      }
+    }
+
+    for (const symbol of this._liveRiskBySymbol.keys()) {
+      if (!openSymbols.has(symbol)) this._liveRiskBySymbol.delete(symbol)
+    }
+
+    for (const order of snapshot.openOrders ?? []) {
+      const key = String(order.clientOrderId ?? order.orderId ?? `${order.symbol}:${Date.now()}`)
+      this._liveOrders.set(key, { ...order })
+    }
+
+    this._emitSnapshot()
+  }
+
+  applyExchangeAccountUpdate(update = {}) {
+    for (const balance of update.balances ?? []) {
+      const asset = balance.asset ?? 'USDT'
+      const existing = this._liveBalances.get(asset) ?? { asset }
+      this._liveBalances.set(asset, {
+        ...existing,
+        ...balance,
+        walletBalance: Number(balance.walletBalance ?? existing.walletBalance ?? 0),
+        crossWalletBalance: Number(balance.crossWalletBalance ?? existing.crossWalletBalance ?? 0),
+        balanceChange: Number(balance.balanceChange ?? 0),
+      })
+    }
+
+    for (const position of update.positions ?? []) {
+      const normalized = this._normalizeLivePosition(position)
+      if (!normalized) continue
+      if (normalized.direction === 'FLAT') {
+        this._livePositions.delete(normalized.symbol)
+        this._liveRiskBySymbol.delete(normalized.symbol)
+      } else {
+        this._livePositions.set(normalized.symbol, normalized)
+      }
+    }
+
+    this._emitSnapshot()
+  }
+
+  applyExchangeOrderUpdate(update = {}) {
+    const key = String(update.clientOrderId ?? update.exchangeOrderId ?? `${update.symbol}:${Date.now()}`)
+    const existing = this._liveOrders.get(key) ?? {}
+    const merged = { ...existing, ...update, updatedAt: Date.now() }
+    this._liveOrders.set(key, merged)
+    this._mergeLivePositionRiskFromOrder(merged)
+    this._emitSnapshot()
+    return merged
+  }
+
+  updateLivePositionRisk({ symbol, stopLoss, takeProfit, stopLossOrigin, sourceSignalId } = {}) {
+    const normalizedSymbol = String(symbol || '').toUpperCase()
+    if (!normalizedSymbol) return null
+    const existingRisk = this._liveRiskBySymbol.get(normalizedSymbol) ?? {}
+    const patch = {}
+    if (stopLoss !== undefined) patch.stopLoss = this._numberOrNull(stopLoss)
+    if (takeProfit !== undefined) patch.takeProfit = this._numberOrNull(takeProfit)
+    if (stopLossOrigin !== undefined) patch.stopLossOrigin = stopLossOrigin ?? null
+    if (sourceSignalId !== undefined) patch.sourceSignalId = sourceSignalId ?? null
+    const nextRisk = { ...existingRisk, ...patch }
+    this._liveRiskBySymbol.set(normalizedSymbol, nextRisk)
+
+    const existingPosition = this._livePositions.get(normalizedSymbol)
+    if (existingPosition) {
+      const updated = { ...existingPosition, ...nextRisk }
+      this._livePositions.set(normalizedSymbol, updated)
+      this._emitSnapshot()
+      return { ...updated }
+    }
+    return null
+  }
+
+  getLiveEquity() {
+    const usdt = this._liveBalances.get('USDT')
+    const available = Number(usdt?.availableBalance)
+    if (Number.isFinite(available) && available > 0) return available
+    const wallet = Number(usdt?.walletBalance ?? usdt?.balance)
+    if (Number.isFinite(wallet) && wallet > 0) return wallet
+    return 0
+  }
+
+  getLiveBalance(asset = 'USDT') {
+    const balance = this._liveBalances.get(String(asset || 'USDT').toUpperCase())
+    return balance ? { ...balance } : null
+  }
+
+  getLiveOpenPositionForSymbol(symbol) {
+    const pos = this._livePositions.get(String(symbol || '').toUpperCase())
+    return pos ? { ...pos } : null
+  }
+
+  getLiveSnapshot() {
+    return {
+      mode: 'live',
+      liveBalances: Array.from(this._liveBalances.values()).map((balance) => ({ ...balance })),
+      liveBalance: this.getLiveBalance('USDT'),
+      livePositions: Array.from(this._livePositions.values()).map((position) => ({ ...position })),
+      liveOrders: Array.from(this._liveOrders.values()).map((order) => ({ ...order })),
+      liveSummary: this._buildLiveSummary(),
+      timestamp: Date.now(),
+    }
+  }
+
+  getLiveDailyPnl() {
+    let total = 0
+    for (const order of this._liveOrders.values()) {
+      total += Number(order.realizedProfit || 0)
+    }
+    return total
+  }
+
+  _normalizeLivePosition(position = {}) {
+    const symbol = String(position.symbol || '').toUpperCase()
+    if (!symbol) return null
+    const amt = Number(position.positionAmt ?? position.quantity ?? 0)
+    const direction = position.direction ?? (amt > 0 ? 'LONG' : amt < 0 ? 'SHORT' : 'FLAT')
+    const positionSide = position.positionSide ?? position.side ?? null
+    const quantity = Math.abs(amt)
+    const entryPrice = Number(position.entryPrice ?? 0)
+    const currentPrice = Number(position.currentPrice ?? position.markPrice ?? entryPrice)
+    const unrealizedPnl = Number(position.unrealizedPnl ?? position.unRealizedProfit ?? 0)
+    const realizedPnl = Number(position.accumulatedRealized ?? position.realizedPnl ?? 0)
+    return {
+      ...position,
+      id: `live:${symbol}`,
+      positionId: `live:${symbol}`,
+      symbol,
+      side: direction,
+      positionSide,
+      direction,
+      positionAmt: amt,
+      quantity,
+      entryPrice,
+      currentPrice,
+      unrealizedPnl,
+      realizedPnl,
+      ...this._liveRiskBySymbol.get(symbol),
+      status: direction === 'FLAT' ? 'CLOSED' : 'OPEN',
+      autoManaged: true,
+      mode: 'live',
+    }
+  }
+
+  _mergeLivePositionRiskFromOrder(order = {}) {
+    if (order.mode !== 'live' || order.reduceOnly) return
+    const symbol = String(order.symbol || '').toUpperCase()
+    if (!symbol) return
+    const patch = {}
+    if (order.stopLoss !== undefined) patch.stopLoss = this._numberOrNull(order.stopLoss)
+    if (order.takeProfit !== undefined) patch.takeProfit = this._numberOrNull(order.takeProfit)
+    if (order.sourceSignalId !== undefined) patch.sourceSignalId = order.sourceSignalId ?? null
+    if (Object.keys(patch).length === 0) return
+    this.updateLivePositionRisk({ symbol, ...patch })
+  }
+
+  _numberOrNull(value) {
+    if (value == null) return null
+    const n = Number(value)
+    return Number.isFinite(n) ? n : null
+  }
+
+  _buildLiveSummary() {
+    const livePositions = Array.from(this._livePositions.values())
+    const usdtBalance = this.getLiveBalance('USDT') ?? {
+      asset: 'USDT',
+      walletBalance: 0,
+      availableBalance: 0,
+      crossWalletBalance: 0,
+    }
+    const walletBalance = Number(usdtBalance.walletBalance ?? usdtBalance.balance ?? 0)
+    const availableBalance = Number(usdtBalance.availableBalance ?? 0)
+    const crossWalletBalance = Number(usdtBalance.crossWalletBalance ?? 0)
+    const exposureBySymbol = {}
+    let totalNotional = 0
+    let unrealizedPnl = 0
+    let realizedPnl = 0
+
+    for (const position of livePositions) {
+      const notional = Number(position.entryPrice || 0) * Number(position.quantity || 0)
+      totalNotional += notional
+      unrealizedPnl += Number(position.unrealizedPnl || 0)
+      realizedPnl += Number(position.realizedPnl || 0)
+      exposureBySymbol[position.symbol] = (exposureBySymbol[position.symbol] || 0) + notional
+    }
+
+    return {
+      asset: usdtBalance.asset ?? 'USDT',
+      equity: this.getLiveEquity(),
+      balance: Number.isFinite(walletBalance) ? walletBalance : 0,
+      walletBalance: Number.isFinite(walletBalance) ? walletBalance : 0,
+      availableBalance: Number.isFinite(availableBalance) ? availableBalance : 0,
+      crossWalletBalance: Number.isFinite(crossWalletBalance) ? crossWalletBalance : 0,
+      openCount: livePositions.length,
+      totalNotional,
+      unrealizedPnl,
+      realizedPnl,
+      dailyPnl: this.getLiveDailyPnl() + unrealizedPnl,
+      exposureBySymbol,
+    }
   }
 
   _today() {
@@ -231,23 +465,37 @@ class PortfolioManager extends PortfolioManagerPort {
       totalNotional,
       bootstrapped: paper.bootstrapped,
     }
+    const liveSnapshot = this.getLiveSnapshot()
     return {
       positions,
+      livePositions: liveSnapshot.livePositions,
+      liveOrders: liveSnapshot.liveOrders,
+      liveBalances: liveSnapshot.liveBalances,
+      liveBalance: liveSnapshot.liveBalance,
       totalNotional,
       exposureBySymbol,
       totalUnrealized,
       totalRealized,
       dailyPnl,
-      liveSummary: {
-        openCount: openPositions.length,
-        totalNotional,
-        unrealizedPnl: totalUnrealized,
-        realizedPnl: totalRealized,
-        exposureBySymbol,
-      },
+      liveSummary: liveSnapshot.liveSummary,
       paper,
       paperSummary,
       timestamp: Date.now(),
+    }
+  }
+
+  async _loadPaperHistory({ userId = null, limit = 100 } = {}) {
+    if (!this.tradingPersistence?.listPaperPositions) return []
+    try {
+      const result = await this.tradingPersistence.listPaperPositions({
+        userId: userId ?? undefined,
+        limit,
+        page: 1,
+      })
+      return Array.isArray(result?.items) ? result.items : []
+    } catch (err) {
+      logger.warn(`[PortfolioManager] load paper history failed: ${err.message}`)
+      return []
     }
   }
 
@@ -343,7 +591,16 @@ class PortfolioManager extends PortfolioManagerPort {
   }
 
   async getSnapshot({ userId = null } = {}) {
-    return this._buildSnapshot(userId)
+    const snapshot = this._buildSnapshot(userId)
+    const paperPositions = await this._loadPaperHistory({ userId })
+    if (paperPositions.length > 0) {
+      snapshot.paperPositions = paperPositions
+      snapshot.paperHistory = paperPositions
+    } else {
+      snapshot.paperPositions = snapshot.positions
+      snapshot.paperHistory = snapshot.positions
+    }
+    return snapshot
   }
 
   async getExposure() {

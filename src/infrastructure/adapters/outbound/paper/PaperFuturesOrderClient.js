@@ -65,6 +65,11 @@ class PaperFuturesOrderClient {
   async cancel(orderId) {
     return { ok: true }
   }
+
+  // eslint-disable-next-line no-unused-vars
+  async getOrder(query) {
+    return null
+  }
 }
 
 module.exports = { PaperFuturesOrderClient }

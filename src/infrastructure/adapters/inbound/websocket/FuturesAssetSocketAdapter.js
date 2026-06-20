@@ -139,6 +139,9 @@ class FuturesAssetSocketAdapter {
     tradingPersistence = null,
     riskManager = null,
     portfolioManager = null,
+    tradingMode = 'paper',
+    paperTradeService = null,
+    executionModeRouter = null,
     scalpConfig = null,
   }) {
     this.io = io
@@ -149,7 +152,9 @@ class FuturesAssetSocketAdapter {
     this.marketDataPort = marketDataPort
     this._roomRefs = new Map()
     this._symbolServices = new Map()
-    this.paperTradeService = new PaperTradeService()
+    this.tradingMode = tradingMode
+    this.paperTradeService = paperTradeService ?? new PaperTradeService()
+    this.executionModeRouter = executionModeRouter ?? this.paperTradeService
     this.tradingPersistence = tradingPersistence
     this.riskManager = riskManager
     this.portfolioManager = portfolioManager
@@ -163,7 +168,8 @@ class FuturesAssetSocketAdapter {
     this.scalpConfig = scalpConfig
     if (scalpConfig?.horizon === 'scalp') {
       logger.info(
-        `[SocketAdapter] Scalp horizon ENABLED — equity=$${scalpConfig.account.equity} ` +
+        `[SocketAdapter] Scalp horizon ENABLED — mode=${this.tradingMode} ` +
+          `sizing=${this.tradingMode === 'live' ? 'live-equity' : `$${scalpConfig.account.equity}`} ` +
           `risk/trade=${(scalpConfig.account.riskPerTradePct * 100).toFixed(2)}% ` +
           `costs=${scalpConfig.costs.feeBps}+${scalpConfig.costs.slippageBps}bps ` +
           `timeStop=${scalpConfig.position.timeStopMs}ms`,
@@ -560,9 +566,7 @@ class FuturesAssetSocketAdapter {
     this._assetContextRefreshInFlight.delete(symbol)
     // Drop closed-position history for this symbol (open positions are kept so
     // that an unsubscribe + resubscribe within a session doesn't lose state).
-    if (this.paperTradeService?.clearSymbolHistory) {
-      this.paperTradeService.clearSymbolHistory(symbol)
-    }
+    this.executionModeRouter?.clearSymbolHistory?.(symbol)
     metrics.activeSymbols.set({}, this._symbolServices.size)
     metrics.activeRooms.set({}, this._roomRefs.size)
     logger.debug(`[SocketAdapter] Services cleaned up for ${symbol}`)
@@ -799,7 +803,7 @@ class FuturesAssetSocketAdapter {
         await new Promise((r) => setTimeout(r, 500))
         await this._resyncLocalBook(normalizedSymbol)
         await this._seedCandleHistory(normalizedSymbol, intervals)
-        await this._restoreOpenPositions(normalizedSymbol)
+        if (this.tradingMode !== 'live') await this._restoreOpenPositions(normalizedSymbol)
         this._startSignalEngineTimer(normalizedSymbol, room)
       }
       this._emitSessionCandleInit(socket, normalizedSymbol)
@@ -1060,7 +1064,21 @@ class FuturesAssetSocketAdapter {
       let autoExecution = null
       const incoming = result.signal
       const isEntrySignal = incoming?.type === 'ENTRY'
-      const currentOpenPosition = this.paperTradeService.getOpenPositionForSymbol(symbol)
+      const currentOpenPosition = this.executionModeRouter.getOpenPositionForSymbol(symbol)
+      if (this.tradingMode === 'live') {
+        const engineInPosition = Boolean(bundle.signalEngine.isInPosition?.())
+        if (currentOpenPosition && !engineInPosition) {
+          bundle.signalEngine.notifyPositionAccepted({
+            direction: currentOpenPosition.direction,
+            entryPrice: currentOpenPosition.entryPrice,
+            takeProfit: currentOpenPosition.takeProfit ?? null,
+            stopLoss: currentOpenPosition.stopLoss ?? null,
+          })
+        } else if (!currentOpenPosition && engineInPosition) {
+          bundle.signalEngine.notifyPositionClosed()
+          bundle._pendingAutoCloseIds.clear()
+        }
+      }
       // Rules in effect right now (regime, thresholds…) — surfaced to the UI
       // on every signal update so the user always knows what the RM enforces.
       const activeRules = this.riskManager?.summarizeActiveRules
@@ -1072,7 +1090,7 @@ class FuturesAssetSocketAdapter {
       if (this.riskManager && isEntrySignal && !currentOpenPosition) {
         try {
           const accountState = {
-            dailyPnl: this.paperTradeService.getDailyPnl?.() ?? 0,
+            dailyPnl: this.executionModeRouter.getDailyPnl?.() ?? 0,
             executionMode: this.scalpConfig?.executionMode ?? 'auto',
             horizon: this.scalpConfig?.horizon ?? 'default',
           }
@@ -1081,9 +1099,12 @@ class FuturesAssetSocketAdapter {
             // cumulative realized PnL across restarts) so position sizing
             // shrinks after losses and grows after wins. Falls back to the
             // static config value if the PortfolioManager isn't wired.
-            accountState.equity = this.portfolioManager?.getPaperEquity?.() ?? this.scalpConfig.account.equity
+            accountState.equity =
+              this.portfolioManager?.getExecutionEquity?.(this.tradingMode) ?? this.scalpConfig.account.equity
             accountState.riskPerTradePct = this.scalpConfig.account.riskPerTradePct
-            if (Number.isFinite(this.scalpConfig.account.maxNotional)) {
+            if (this.tradingMode === 'live' && Number.isFinite(this.executionModeRouter?.liveMaxNotionalPerOrder)) {
+              accountState.maxNotional = this.executionModeRouter.liveMaxNotionalPerOrder
+            } else if (Number.isFinite(this.scalpConfig.account.maxNotional)) {
               accountState.maxNotional = this.scalpConfig.account.maxNotional
             }
             accountState.contractMultiplier = this.scalpConfig.account.contractMultiplier
@@ -1258,7 +1279,7 @@ class FuturesAssetSocketAdapter {
       const b = this._symbolServices.get(symbol)
       if (!b) return
       try {
-        const opened = this.paperTradeService.openPosition({
+        Promise.resolve(this.executionModeRouter.openPosition({
           symbol,
           userId: 'risk-manager',
           direction,
@@ -1276,46 +1297,55 @@ class FuturesAssetSocketAdapter {
             minRiskReward: decision.minRiskReward,
             reasons: decision.reasons,
           },
+        })).then((opened) => {
+          if (this.tradingMode !== 'live') {
+            this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_OPENED, opened, {
+              stream: 'paperTrade.opened',
+              symbol,
+            })
+            this._emitPaperPortfolioSnapshot()
+            this._persistPaperPosition(opened)
+          }
+          this._persistSignalHistory({
+            timestamp: Date.now(),
+            symbol,
+            interval: b.signalEngine.interval,
+            state: b.signalEngine.getState(),
+            prevState: b.signalEngine.getState(),
+            netScore: signal.score ?? 0,
+            confidence: signal.confidence ?? 0,
+            reasons: decision.reasons ?? [],
+            missingContext: [],
+            decision: this.tradingMode === 'live' ? 'AUTO_ORDER_SUBMITTED' : 'AUTO_ACCEPTED',
+            activeSignalId: signal.id,
+            positionId: opened?.id ?? opened?.orderId ?? null,
+            signalRisk: signal.risk ?? null,
+            adjustedRisk: decision.adjustedRisk ?? null,
+            autoExecution: {
+              mode: decision.mode,
+              approved: decision.approved,
+              rule: decision.rule,
+              regime: decision.regime,
+              reasons: decision.reasons,
+            },
+          })
+          if (this.tradingMode !== 'live') {
+            b.signalEngine.notifyPositionAccepted({
+              direction,
+              entryPrice: fillPrice,
+              takeProfit,
+              stopLoss,
+            })
+          }
+          logger.info(
+            `[SocketAdapter] [RISK-AUTO] opened ${direction} ${symbol} @ ${fillPrice} ` +
+              `(signalEntry=${signalEntry}, regime=${decision.regime}, conf=${signal.confidence}%, rule=${decision.rule})`,
+          )
+        }).catch((err) => {
+          if (err?.code !== 'POSITION_ALREADY_OPEN') {
+            logger.warn(`[SocketAdapter] auto-open failed for ${symbol}: ${err.message}`)
+          }
         })
-        this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_OPENED, opened, {
-          stream: 'paperTrade.opened',
-          symbol,
-        })
-        this._emitPaperPortfolioSnapshot()
-        this._persistPaperPosition(opened)
-        this._persistSignalHistory({
-          timestamp: Date.now(),
-          symbol,
-          interval: b.signalEngine.interval,
-          state: b.signalEngine.getState(),
-          prevState: b.signalEngine.getState(),
-          netScore: signal.score ?? 0,
-          confidence: signal.confidence ?? 0,
-          reasons: decision.reasons ?? [],
-          missingContext: [],
-          decision: 'AUTO_ACCEPTED',
-          activeSignalId: signal.id,
-          positionId: opened.id,
-          signalRisk: signal.risk ?? null,
-          adjustedRisk: decision.adjustedRisk ?? null,
-          autoExecution: {
-            mode: decision.mode,
-            approved: decision.approved,
-            rule: decision.rule,
-            regime: decision.regime,
-            reasons: decision.reasons,
-          },
-        })
-        b.signalEngine.notifyPositionAccepted({
-          direction,
-          entryPrice: fillPrice,
-          takeProfit,
-          stopLoss,
-        })
-        logger.info(
-          `[SocketAdapter] [RISK-AUTO] opened ${direction} ${symbol} @ ${fillPrice} ` +
-            `(signalEntry=${signalEntry}, regime=${decision.regime}, conf=${signal.confidence}%, rule=${decision.rule})`,
-        )
       } catch (err) {
         if (err?.code !== 'POSITION_ALREADY_OPEN') {
           logger.warn(`[SocketAdapter] auto-open failed for ${symbol}: ${err.message}`)
@@ -1351,50 +1381,57 @@ class FuturesAssetSocketAdapter {
       const sourceSignalId = position.sourceSignalId ?? null
       setTimeout(() => {
         const b = this._symbolServices.get(symbol)
-        if (b) b._pendingAutoCloseIds.delete(positionId)
+        if (b && this.tradingMode !== 'live') b._pendingAutoCloseIds.delete(positionId)
         const fillPrice = this._symbolServices.get(symbol)?._lastMarkPrice ?? bundle._lastMarkPrice
-        const closed = this.paperTradeService.closePosition({
+        Promise.resolve(this.executionModeRouter.closePosition({
           symbol,
           positionId,
           closePrice: fillPrice,
           closeReason,
+        })).then((closed) => {
+          if (!closed) return
+          if (this.tradingMode !== 'live') {
+            this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_CLOSED, closed, {
+              stream: 'paperTrade.closed',
+              symbol,
+            })
+            this._persistPaperPosition(closed)
+            this.portfolioManager?.recordPaperClose(closed)
+            this._emitPaperPortfolioSnapshot()
+          }
+          const bAfter = this._symbolServices.get(symbol)
+          this._persistSignalHistory({
+            timestamp: Date.now(),
+            symbol,
+            interval: bAfter?.signalEngine.interval ?? '1m',
+            state: bAfter?.signalEngine.getState() ?? 'UNKNOWN',
+            prevState: bAfter?.signalEngine.getState() ?? 'UNKNOWN',
+            netScore: 0,
+            confidence: 0,
+            reasons: [closeActionReason],
+            missingContext: [],
+            decision: 'AUTO_CLOSED',
+            activeSignalId: sourceSignalId,
+            positionId,
+          })
+          if (bAfter && this.tradingMode !== 'live') {
+            bAfter.signalEngine.notifyPositionClosed()
+            bAfter._lastSignalEngineRunAt = 0
+            this._runSignalEngine(symbol, room)
+          }
+          logger.info(
+            `[SocketAdapter] [RISK-AUTO] closed ${symbol} reason=${closeReason} fillPrice=${fillPrice} (delayed ${PAPER_FILL_DELAY_MS}ms)`,
+          )
+        }).catch((err) => {
+          const bAfterError = this._symbolServices.get(symbol)
+          if (bAfterError) bAfterError._pendingAutoCloseIds.delete(positionId)
+          logger.warn(`[SocketAdapter] auto-close failed for ${symbol}: ${err.message}`)
         })
-        if (!closed) return
-        this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_CLOSED, closed, {
-          stream: 'paperTrade.closed',
-          symbol,
-        })
-        this._persistPaperPosition(closed)
-        this.portfolioManager?.recordPaperClose(closed)
-        this._emitPaperPortfolioSnapshot()
-        const bAfter = this._symbolServices.get(symbol)
-        this._persistSignalHistory({
-          timestamp: Date.now(),
-          symbol,
-          interval: bAfter?.signalEngine.interval ?? '1m',
-          state: bAfter?.signalEngine.getState() ?? 'UNKNOWN',
-          prevState: bAfter?.signalEngine.getState() ?? 'UNKNOWN',
-          netScore: 0,
-          confidence: 0,
-          reasons: [closeActionReason],
-          missingContext: [],
-          decision: 'AUTO_CLOSED',
-          activeSignalId: sourceSignalId,
-          positionId,
-        })
-        if (bAfter) {
-          bAfter.signalEngine.notifyPositionClosed()
-          bAfter._lastSignalEngineRunAt = 0
-          this._runSignalEngine(symbol, room)
-        }
-        logger.info(
-          `[SocketAdapter] [RISK-AUTO] closed ${symbol} reason=${closeReason} fillPrice=${fillPrice} (delayed ${PAPER_FILL_DELAY_MS}ms)`,
-        )
       }, PAPER_FILL_DELAY_MS)
       return
     }
     if (action.action === 'ADJUST_SL' && Number.isFinite(action.newStopLoss)) {
-      const updated = this.paperTradeService.updateStops({
+      const updated = this.executionModeRouter.updateStops({
         symbol,
         positionId: position.id,
         stopLoss: action.newStopLoss,
@@ -1411,7 +1448,7 @@ class FuturesAssetSocketAdapter {
     }
   }
 
-  _onSignalPositionAccept(socket, data) {
+  async _onSignalPositionAccept(socket, data) {
     const symbol = socket._futuresSymbol
     if (!symbol) return
     const bundle = this._symbolServices.get(symbol)
@@ -1447,7 +1484,7 @@ class FuturesAssetSocketAdapter {
     const entryPrice = data?.entryPrice != null ? Number(data.entryPrice) : fallbackPrice
     if (entryPrice != null && Number.isFinite(entryPrice) && direction) {
       try {
-        const opened = this.paperTradeService.openPosition({
+        const opened = await this.executionModeRouter.openPosition({
           symbol,
           userId: socket.id,
           direction,
@@ -1457,13 +1494,14 @@ class FuturesAssetSocketAdapter {
           takeProfit: data?.takeProfit ?? null,
           sourceSignalId: signalId,
         })
-        this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_OPENED, opened, {
-          stream: 'paperTrade.opened',
-          symbol,
-        })
-
-        this._persistPaperPosition(opened)
-        this._emitPaperPortfolioSnapshot()
+        if (this.tradingMode !== 'live') {
+          this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_OPENED, opened, {
+            stream: 'paperTrade.opened',
+            symbol,
+          })
+          this._persistPaperPosition(opened)
+          this._emitPaperPortfolioSnapshot()
+        }
         this._persistSignalHistory({
           timestamp: Date.now(),
           symbol,
@@ -1474,48 +1512,52 @@ class FuturesAssetSocketAdapter {
           confidence: 0,
           reasons: [],
           missingContext: [],
-          decision: 'POSITION_ACCEPTED',
+          decision: this.tradingMode === 'live' ? 'POSITION_ORDER_SUBMITTED' : 'POSITION_ACCEPTED',
           activeSignalId: signalId,
-          positionId: opened.id,
+          positionId: opened?.id ?? opened?.orderId ?? null,
         })
       } catch (err) {
-        logger.warn(`[SocketAdapter] paper trade open failed for ${symbol}: ${err.message}`)
+        logger.warn(`[SocketAdapter] trade open failed for ${symbol}: ${err.message}`)
       }
     } else if (!direction) {
       logger.warn(`[SocketAdapter] paper trade open skipped for ${symbol}: missing direction`)
     }
 
-    bundle.signalEngine.notifyPositionAccepted({
-      direction,
-      entryPrice: data?.entryPrice != null ? Number(data.entryPrice) : null,
-      takeProfit: data?.takeProfit != null ? Number(data.takeProfit) : null,
-      stopLoss: data?.stopLoss != null ? Number(data.stopLoss) : null,
-    })
+    if (this.tradingMode !== 'live') {
+      bundle.signalEngine.notifyPositionAccepted({
+        direction,
+        entryPrice: data?.entryPrice != null ? Number(data.entryPrice) : null,
+        takeProfit: data?.takeProfit != null ? Number(data.takeProfit) : null,
+        stopLoss: data?.stopLoss != null ? Number(data.stopLoss) : null,
+      })
+    }
     const room = `futures:${symbol}`
     bundle._lastSignalEngineRunAt = 0
     this._runSignalEngine(symbol, room)
     logger.debug(`[SocketAdapter] Signal position accepted for ${symbol}`)
   }
 
-  _onSignalPositionClose(socket, data) {
+  async _onSignalPositionClose(socket, data) {
     const symbol = socket._futuresSymbol
     if (!symbol) return
     const bundle = this._symbolServices.get(symbol)
     if (!bundle) return
 
-    const closed = this.paperTradeService.closeLatestOpenPosition({
+    const closed = await this.executionModeRouter.closeLatestOpenPosition({
       symbol,
       closePrice: bundle._lastMarkPrice,
       closeReason: 'MANUAL',
     })
     if (closed) {
-      this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_CLOSED, closed, {
-        stream: 'paperTrade.closed',
-        symbol,
-      })
-      this._persistPaperPosition(closed)
-      this.portfolioManager?.recordPaperClose(closed)
-      this._emitPaperPortfolioSnapshot()
+      if (this.tradingMode !== 'live') {
+        this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_CLOSED, closed, {
+          stream: 'paperTrade.closed',
+          symbol,
+        })
+        this._persistPaperPosition(closed)
+        this.portfolioManager?.recordPaperClose(closed)
+        this._emitPaperPortfolioSnapshot()
+      }
       this._persistSignalHistory({
         timestamp: Date.now(),
         symbol,
@@ -1528,11 +1570,13 @@ class FuturesAssetSocketAdapter {
         missingContext: [],
         decision: 'POSITION_CLOSED',
         activeSignalId: null,
-        positionId: closed.id,
+        positionId: closed?.id ?? closed?.orderId ?? null,
       })
     }
 
-    bundle.signalEngine.notifyPositionClosed()
+    if (this.tradingMode !== 'live') {
+      bundle.signalEngine.notifyPositionClosed()
+    }
     const room = `futures:${symbol}`
     bundle._lastSignalEngineRunAt = 0
     this._runSignalEngine(symbol, room)
@@ -1540,7 +1584,7 @@ class FuturesAssetSocketAdapter {
   }
 
   _processPaperTradeTick(symbol, room, price, backendReceivedAt = Date.now()) {
-    const events = this.paperTradeService.onPriceTick({
+    const events = this.executionModeRouter.onPriceTick({
       symbol,
       price,
       now: Date.now(),
@@ -1662,7 +1706,7 @@ class FuturesAssetSocketAdapter {
       const sorted = positions.slice().sort((a, b) => (b.openedAt ?? 0) - (a.openedAt ?? 0))
       const keeper = sorted[0]
       if (keeper) {
-        this.paperTradeService.importPosition({
+        this.executionModeRouter.importPosition({
           id: keeper.positionId,
           userId: keeper.userId ?? null,
           symbol: keeper.symbol,
@@ -1685,7 +1729,7 @@ class FuturesAssetSocketAdapter {
 
         // Re-broadcast the restored position so the (re)connecting frontend
         // can hydrate its store and resume PnL updates immediately.
-        const restored = this.paperTradeService.getOpenPositionForSymbol(symbol)
+        const restored = this.executionModeRouter.getOpenPositionForSymbol(symbol)
         if (restored) {
           this._emitToRoom(`futures:${symbol}`, FUTURES_SOCKET_EVENTS.PAPER_TRADE_OPENED, restored, {
             stream: 'paperTrade.opened',

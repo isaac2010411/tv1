@@ -14,6 +14,11 @@ const toNumber = (value, fallback) => {
   return Number.isFinite(n) ? n : fallback
 }
 
+const toInteger = (value, fallback) => {
+  const n = toNumber(value, fallback)
+  return Number.isFinite(n) ? Math.trunc(n) : fallback
+}
+
 const loadExecutionMode = (raw) => {
   const v = String(raw || 'auto').toLowerCase()
   return v === 'semi' || v === 'manual' ? 'semi' : 'auto'
@@ -65,6 +70,31 @@ const loadRuntimeConfig = (env = process.env) => {
     throw new Error('ENABLE_LIVE_TRADING must be true when TRADING_MODE is live')
   }
 
+  const liveDryRun = toBoolean(env.LIVE_DRY_RUN)
+  const liveSymbolAllowlist = toList(env.LIVE_SYMBOL_ALLOWLIST).map((symbol) => symbol.toUpperCase())
+  const liveMaxOpenPositions = toInteger(env.LIVE_MAX_OPEN_POSITIONS, 1)
+  const liveMaxNotionalPerOrder = toNumber(env.LIVE_MAX_NOTIONAL_PER_ORDER, 50)
+  const liveMaxDailyLoss = toNumber(env.LIVE_MAX_DAILY_LOSS, 20)
+  const liveRequireUserStream = env.LIVE_REQUIRE_USER_STREAM == null
+    ? true
+    : toBoolean(env.LIVE_REQUIRE_USER_STREAM)
+  const liveOrderFillTimeoutMs = toInteger(env.LIVE_ORDER_FILL_TIMEOUT_MS, 10_000)
+
+  if (tradingMode === 'live') {
+    if (liveSymbolAllowlist.length === 0) {
+      throw new Error('LIVE_SYMBOL_ALLOWLIST is required when TRADING_MODE is live')
+    }
+    if (!Number.isFinite(liveMaxOpenPositions) || liveMaxOpenPositions <= 0) {
+      throw new Error('LIVE_MAX_OPEN_POSITIONS must be greater than 0 when TRADING_MODE is live')
+    }
+    if (!Number.isFinite(liveMaxNotionalPerOrder) || liveMaxNotionalPerOrder <= 0) {
+      throw new Error('LIVE_MAX_NOTIONAL_PER_ORDER must be greater than 0 when TRADING_MODE is live')
+    }
+    if (!Number.isFinite(liveMaxDailyLoss) || liveMaxDailyLoss <= 0) {
+      throw new Error('LIVE_MAX_DAILY_LOSS must be greater than 0 when TRADING_MODE is live')
+    }
+  }
+
   if (nodeEnv === 'production' && allowedOrigins.length === 0) {
     throw new Error('CORS_ALLOWED_ORIGINS is required in production')
   }
@@ -84,6 +114,13 @@ const loadRuntimeConfig = (env = process.env) => {
     port: Number.parseInt(env.PORT || '5000', 10),
     tradingMode,
     liveTradingEnabled: toBoolean(env.ENABLE_LIVE_TRADING),
+    liveDryRun,
+    liveSymbolAllowlist,
+    liveMaxOpenPositions,
+    liveMaxNotionalPerOrder,
+    liveMaxDailyLoss,
+    liveRequireUserStream,
+    liveOrderFillTimeoutMs,
     corsOptions,
     binance: {
       apiKey: env.BINANCE_API_KEY || '',

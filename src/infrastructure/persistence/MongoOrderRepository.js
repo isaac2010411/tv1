@@ -50,6 +50,27 @@ class MongoOrderRepository extends OrderRepositoryPort {
     return doc || null
   }
 
+  async findByClientOrderId(clientOrderId) {
+    if (!clientOrderId) return null
+    if (!this._useDb()) {
+      const doc = Array.from(this._fallback.values()).find((o) => o.clientOrderId === clientOrderId)
+      return doc ? { ...doc } : null
+    }
+    const doc = await OrderModel.findOne({ clientOrderId }).lean()
+    return doc || null
+  }
+
+  async findByExchangeOrderId(exchangeOrderId) {
+    if (!exchangeOrderId) return null
+    const id = String(exchangeOrderId)
+    if (!this._useDb()) {
+      const doc = Array.from(this._fallback.values()).find((o) => String(o.exchangeOrderId) === id)
+      return doc ? { ...doc } : null
+    }
+    const doc = await OrderModel.findOne({ exchangeOrderId: id }).lean()
+    return doc || null
+  }
+
   async findOpen({ symbol, userId } = {}) {
     const openStatuses = ['NEW', 'PARTIAL']
     if (!this._useDb()) {
@@ -94,6 +115,17 @@ class MongoOrderRepository extends OrderRepositoryPort {
     const existing = await this.findById(orderId)
     if (!existing) return null
     const updated = { ...existing, ...patch }
+    await this.save(updated)
+    return updated
+  }
+
+  async appendExchangeEvent(orderId, event) {
+    const existing = await this.findById(orderId)
+    if (!existing) return null
+    const updated = {
+      ...existing,
+      exchangeEvents: [...(existing.exchangeEvents ?? []), event],
+    }
     await this.save(updated)
     return updated
   }

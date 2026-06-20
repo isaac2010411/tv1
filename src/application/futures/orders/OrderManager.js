@@ -125,9 +125,28 @@ class OrderManager extends OrderManagerPort {
       }
     }
 
+    const orderId = crypto.randomUUID()
+    const precomputedClientOrderId =
+      typeof this.exchangeClient.getClientOrderId === 'function'
+        ? this.exchangeClient.getClientOrderId({ ...input, orderId, symbol, quantity: finalQty })
+        : null
+
     const order = {
-      orderId: crypto.randomUUID(),
+      orderId,
       userId,
+      mode: input.mode ?? null,
+      sourceSignalId: input.sourceSignalId ?? null,
+      closeReason: input.closeReason ?? null,
+      entryPrice: input.entryPrice != null ? Number(input.entryPrice) : candidate.price,
+      stopLoss: input.stopLoss != null ? Number(input.stopLoss) : null,
+      takeProfit: input.takeProfit != null ? Number(input.takeProfit) : null,
+      requestedQuantity: finalQty,
+      executedQuantity: 0,
+      averageFillPrice: null,
+      lastFillPrice: null,
+      grossNotional: 0,
+      feeDetails: [],
+      netRealizedProfit: 0,
       symbol,
       side: candidate.side,
       type: candidate.type,
@@ -141,6 +160,13 @@ class OrderManager extends OrderManagerPort {
       riskDecision: decision,
       reason: null,
       positionId: null,
+      exchangeOrderId: null,
+      clientOrderId: precomputedClientOrderId,
+      exchangeStatus: null,
+      exchangeEvents: [],
+      realizedProfit: 0,
+      commission: 0,
+      commissionAsset: null,
     }
     await this.orderRepository.save(order)
     await this._notifyLifecycle(order)
@@ -155,21 +181,40 @@ class OrderManager extends OrderManagerPort {
       throw new OrderRejectedError(`Exchange error: ${err.message}`)
     }
 
+    const resultFills = Array.isArray(exchangeResult.fills) ? exchangeResult.fills : []
+    const fillQuantity = resultFills.reduce((acc, fill) => acc + Number(fill.quantity || 0), 0)
+    const fillNotional = resultFills.reduce(
+      (acc, fill) => acc + Number(fill.quantity || 0) * Number(fill.price || 0),
+      0,
+    )
+    const derivedAverageFillPrice = fillQuantity > 0 ? fillNotional / fillQuantity : null
+
     const updated = {
       ...order,
       status: exchangeResult.status,
-      fills: exchangeResult.fills || [],
+      exchangeOrderId: exchangeResult.exchangeOrderId ?? null,
+      clientOrderId: exchangeResult.clientOrderId ?? null,
+      exchangeStatus: exchangeResult.exchangeStatus ?? exchangeResult.status ?? null,
+      exchangeEvents: exchangeResult.raw ? [exchangeResult.raw] : [],
+      fills: resultFills,
+      executedQuantity: Number(exchangeResult.executedQuantity ?? fillQuantity),
+      averageFillPrice: exchangeResult.averageFillPrice ?? derivedAverageFillPrice,
+      lastFillPrice: exchangeResult.lastFillPrice ?? resultFills.at(-1)?.price ?? null,
+      grossNotional: Number(exchangeResult.grossNotional ?? fillNotional),
       executedAt: Date.now(),
       reason: exchangeResult.reason || null,
     }
 
-    if (updated.status === 'FILLED' && this.portfolioManager?.applyFill) {
+    const shouldApplyPaperFill = updated.status === 'FILLED' && updated.mode !== 'live'
+    if (shouldApplyPaperFill && this.portfolioManager?.applyFill) {
       try {
         const positionId = await this.portfolioManager.applyFill(updated)
         if (positionId) updated.positionId = positionId
       } catch (err) {
         logger.warn(`[OrderManager] portfolio applyFill failed: ${err.message}`)
       }
+    } else if (updated.mode === 'live' && this.portfolioManager?.applyExchangeOrderUpdate) {
+      this.portfolioManager.applyExchangeOrderUpdate(updated)
     }
 
     await this.orderRepository.save(updated)

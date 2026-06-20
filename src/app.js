@@ -69,22 +69,35 @@ const createApp = async () => {
     socketAdapter,
     realtimePort,
     portfolioManager,
+    liveTradingSupervisor,
   } = buildFuturesContainer({
     binanceClient,
     io,
     tradingPersistence: persistence,
     scalpConfig: runtimeConfig.scalp,
+    runtimeConfig,
   })
 
   // Replay cumulative paper-trading PnL from MongoDB so the virtual $10k cap
   // continues from wherever the last session left it (instead of resetting to
   // the starting equity on every restart).
-  try {
-    await portfolioManager.bootstrapPaperFromPersistence({
-      startingEquity: runtimeConfig.scalp?.account?.equity ?? 10_000,
-    })
-  } catch (err) {
-    logger.warn(`[Startup] bootstrap paper account failed: ${err.message}`)
+  if (runtimeConfig.tradingMode !== 'live') {
+    try {
+      await portfolioManager.bootstrapPaperFromPersistence({
+        startingEquity: runtimeConfig.scalp?.account?.equity ?? 10_000,
+      })
+    } catch (err) {
+      logger.warn(`[Startup] bootstrap paper account failed: ${err.message}`)
+    }
+  }
+
+  if (runtimeConfig.tradingMode === 'live') {
+    try {
+      await liveTradingSupervisor?.start?.()
+    } catch (err) {
+      logger.error(`[Startup] live supervisor failed: ${err.message}`)
+      throw err
+    }
   }
 
   // ── HTTP routes ────────────────────────────────────────────────────────────
@@ -133,6 +146,11 @@ const createApp = async () => {
     try {
       stopMemorySampler()
       stopGcObserver()
+      try {
+        liveTradingSupervisor?.stop?.()
+      } catch (err) {
+        logger.warn(`[Shutdown] live supervisor stop error: ${err.message}`)
+      }
       try {
         await realtimePort.disposeAll?.()
       } catch (err) {

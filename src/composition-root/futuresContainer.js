@@ -22,9 +22,19 @@ const { UnsubscribeFuturesAsset } = require('../application/futures/use-cases/Un
 const { RiskManager } = require('../application/futures/risk/RiskManager')
 const { OrderManager } = require('../application/futures/orders/OrderManager')
 const { PortfolioManager } = require('../application/futures/portfolio/PortfolioManager')
+const { ExecutionModeRouter } = require('../application/futures/execution/ExecutionModeRouter')
+const { LiveAccountSynchronizer } = require('../application/futures/live/LiveAccountSynchronizer')
+const { LiveTradingSupervisor } = require('../application/futures/live/LiveTradingSupervisor')
+const { PaperTradeService } = require('../domain/futures/services/PaperTradeService')
 
 const { MongoOrderRepository } = require('../infrastructure/persistence/MongoOrderRepository')
 const { PaperFuturesOrderClient } = require('../infrastructure/adapters/outbound/paper/PaperFuturesOrderClient')
+const {
+  BinanceFuturesOrderClient,
+} = require('../infrastructure/adapters/outbound/binance/BinanceFuturesOrderClient')
+const {
+  BinanceUserDataStreamAdapter,
+} = require('../infrastructure/adapters/outbound/binance/BinanceUserDataStreamAdapter')
 
 const { FuturesAssetController } = require('../infrastructure/adapters/inbound/http/FuturesAssetController')
 const { createFuturesAssetRouter } = require('../infrastructure/adapters/inbound/http/futuresRoutes')
@@ -60,7 +70,14 @@ const { createPortfolioRouter } = require('../infrastructure/adapters/inbound/ht
  *  portfolioManager: PortfolioManager,
  * }}
  */
-const buildFuturesContainer = ({ binanceClient, io, tradingPersistence = null, scalpConfig = null }) => {
+const buildFuturesContainer = ({
+  binanceClient,
+  io,
+  tradingPersistence = null,
+  scalpConfig = null,
+  runtimeConfig = {},
+}) => {
+  const tradingMode = runtimeConfig.tradingMode ?? 'paper'
   // ── Outbound adapters ─────────────────────────────────────────────────────
   const tradingRulesPort = new BinanceFuturesTradingRulesAdapter(binanceClient)
   const marketDataPort = new BinanceFuturesMarketDataAdapter(binanceClient)
@@ -78,13 +95,55 @@ const buildFuturesContainer = ({ binanceClient, io, tradingPersistence = null, s
     startingEquity: scalpConfig?.account?.equity ?? 10_000,
   })
   const orderRepository = new MongoOrderRepository()
-  const exchangeClient = new PaperFuturesOrderClient({ marketDataPort })
+  const exchangeClient =
+    tradingMode === 'live'
+      ? new BinanceFuturesOrderClient({
+          binanceClient,
+          dryRun: runtimeConfig.liveDryRun,
+        })
+      : new PaperFuturesOrderClient({ marketDataPort })
   const orderManager = new OrderManager({
     orderRepository,
     riskGuard: riskManager,
     exchangeClient,
     portfolioManager,
     realtimeNotifier: null,
+  })
+  const paperTradeService = new PaperTradeService()
+  const liveAccountSynchronizer =
+    tradingMode === 'live'
+      ? new LiveAccountSynchronizer({
+          portfolioManager,
+          orderRepository,
+          realtimeNotifier: null,
+          assetContextManager: null,
+        })
+      : null
+  const userDataStreamAdapter =
+    tradingMode === 'live' ? new BinanceUserDataStreamAdapter({ binanceClient }) : null
+  const liveTradingSupervisor =
+    tradingMode === 'live'
+      ? new LiveTradingSupervisor({
+          accountPort,
+          userDataStreamAdapter,
+          synchronizer: liveAccountSynchronizer,
+          portfolioManager,
+          realtimeNotifier: null,
+          requireUserStream: runtimeConfig.liveRequireUserStream,
+        })
+      : null
+  const executionModeRouter = new ExecutionModeRouter({
+    tradingMode,
+    liveTradingEnabled: runtimeConfig.liveTradingEnabled,
+    paperTradeService,
+    orderManager,
+    portfolioManager,
+    liveTradingSupervisor,
+    tradingRulesPort,
+    liveSymbolAllowlist: runtimeConfig.liveSymbolAllowlist ?? [],
+    liveMaxOpenPositions: runtimeConfig.liveMaxOpenPositions,
+    liveMaxNotionalPerOrder: runtimeConfig.liveMaxNotionalPerOrder,
+    liveMaxDailyLoss: runtimeConfig.liveMaxDailyLoss,
   })
 
   // ── Application use cases ─────────────────────────────────────────────────
@@ -95,6 +154,7 @@ const buildFuturesContainer = ({ binanceClient, io, tradingPersistence = null, s
     riskManager,
     portfolioManager,
   })
+  if (liveAccountSynchronizer) liveAccountSynchronizer.assetContextManager = assetContextManager
   const getAssetContextUseCase = new GetFuturesAssetContext({ assetContextManager })
   const validateOrderUseCase = new ValidateFuturesOrder({ tradingRulesPort, riskGuard: riskManager })
   const subscribeFuturesAssetUseCase = new SubscribeFuturesAsset({ realtimePort, marketDataPort })
@@ -111,12 +171,17 @@ const buildFuturesContainer = ({ binanceClient, io, tradingPersistence = null, s
     tradingPersistence,
     riskManager,
     portfolioManager,
+    tradingMode,
+    paperTradeService,
+    executionModeRouter,
     scalpConfig,
   })
 
   // Back-fill the realtime notifier now that the adapter exists.
   portfolioManager.realtimeNotifier = socketAdapter
   orderManager.realtimeNotifier = socketAdapter
+  if (liveAccountSynchronizer) liveAccountSynchronizer.realtimeNotifier = socketAdapter
+  if (liveTradingSupervisor) liveTradingSupervisor.realtimeNotifier = socketAdapter
 
   const controller = new FuturesAssetController({
     getAssetContextUseCase,
@@ -146,6 +211,8 @@ const buildFuturesContainer = ({ binanceClient, io, tradingPersistence = null, s
     riskManager,
     orderManager,
     portfolioManager,
+    executionModeRouter,
+    liveTradingSupervisor,
   }
 }
 
